@@ -1,7 +1,7 @@
 # rexterm
 
 rexterm is WezTerm (from the ykawa/wezterm fork, with floating panes) with a native
-[Rex](https://superlogical.com) domain. Rex sessions show as native WezTerm tabs,
+Rex domain. Rex sessions show as native WezTerm tabs,
 splits and popups, locally and through an SSH shell, as a replacement for tmux.
 
 This directory holds what the GUI build does not: the launcher, the Lua
