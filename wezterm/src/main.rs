@@ -5,7 +5,7 @@ use clap_complete::{generate as generate_completion, shells, Generator as Comple
 use config::{wezterm_version, ConfigHandle};
 use mux::Mux;
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use termwiz::caps::Capabilities;
 use termwiz::escape::esc::{Esc, EscCode};
 use termwiz::escape::OneBased;
@@ -150,6 +150,9 @@ use termwiz::escape::osc::{
 
 #[derive(Debug, Parser, Clone)]
 struct ImgCatCommand {
+    /// Use snapshot-persistent Kitty graphics (automatic inside Rex).
+    #[arg(long)]
+    kitty: bool,
     /// Specify the display width; defaults to "auto" which automatically selects
     /// an appropriate size.  You may also use an integer value `N` to specify the
     /// number of cells, or `Npx` to specify the number of pixels, or `N%` to
@@ -510,6 +513,9 @@ impl ImgCatCommand {
         let term_size = probe.screen_size()?;
 
         let is_tmux = xt_version.is_tmux();
+        let kitty = self.kitty || std::env::var_os("REX_BLOCK_ID").is_some()
+            || std::env::var_os("WEZTERM_REX").is_some()
+            || xt_version.full_version().to_ascii_lowercase().contains("ghostty");
 
         // TODO: ideally we'd do some kind of probing to see if conpty
         // is in the mix. For now we just assume that if we are on windows
@@ -521,7 +527,7 @@ impl ImgCatCommand {
         // explicitly after we've drawn things.
         // We can only do this reasonably sanely if we aren't setting
         // the absolute position.
-        let needs_force_cursor_move = !self.no_move_cursor && !self.position.is_some() && (is_tmux || is_conpty)
+        let needs_force_cursor_move = !self.no_move_cursor && !self.position.is_some() && (is_tmux || is_conpty || kitty)
             // We can only use forced movement if we know the pixel geometry
             && (term_size.xpixel != 0 && term_size.ypixel != 0);
 
@@ -557,6 +563,28 @@ impl ImgCatCommand {
             }])?;
         }
 
+        if kitty {
+            use base64::Engine;
+            // Direct, bounded chunks work through SSH and persist in Rex's
+            // snapshot. Neither endpoint needs access to the other's files.
+            let png = if image_info.format == image::ImageFormat::Png { data } else {
+                let mut png=Vec::new();
+                image::load_from_memory(&data)?.write_to(&mut std::io::Cursor::new(&mut png),image::ImageFormat::Png)?;
+                png
+            };
+            let encoded=base64::engine::general_purpose::STANDARD.encode(png);
+            let chunks=encoded.as_bytes().chunks(4096);let count=chunks.len();
+            for (i,chunk) in chunks.enumerate() {
+                let more=usize::from(i+1<count);
+                let header=if i==0 {format!("a=T,f=100,t=d,q=2,C=1,c={},r={},m={more}",image_dims.0.max(1),image_dims.1.max(1))}
+                    else {format!("m={more}")};
+                let sequence=format!("\x1b_G{header};{}\x1b\\",std::str::from_utf8(chunk)?);
+                print!("{}",self.tmux_passthru.unwrap_or_default().encode(sequence));
+            }
+            std::io::stdout().flush()?;
+            // The common explicit movement below reserves exactly the image
+            // rows, with no extra newline from the transport encoding.
+        } else {
         let osc = OperatingSystemCommand::ITermProprietary(ITermProprietary::File(Box::new(
             ITermFileData {
                 name: None,
@@ -574,6 +602,7 @@ impl ImgCatCommand {
             .unwrap_or_default()
             .encode(osc.to_string());
         println!("{encoded}");
+        }
 
         if let ((_cursor_x, cursor_y), true) = (image_dims, needs_force_cursor_move) {
             // tell the terminal that doesn't fully understand the image sequence

@@ -111,6 +111,17 @@ vec4 to_srgb(vec4 linearRGB)
 }
 
 void main() {
+  if (o_has_color == 5.0 || o_has_color == 6.0) {
+    // Constant RGB already converted to sRGB by the vertex shader. Glyph
+    // coverage and subpixel blending still come from the original texture.
+    color = o_fg_color;
+    colorMask = vec4(1.0);
+    if (o_has_color == 6.0) {
+      colorMask = texture(atlas_nearest_sampler, o_tex);
+      if (!subpixel_aa) { color.a = colorMask.a; }
+    }
+    return;
+  }
   vec4 fg_color = mix(o_fg_color, o_fg_color_alt, o_fg_color_mix);
   if (o_has_color == 3.0) {
     // Solid color block

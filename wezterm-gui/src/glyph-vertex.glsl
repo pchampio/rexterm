@@ -13,6 +13,7 @@ in vec3 hsv;
 in vec4 alt_color;
 
 uniform mat4 projection;
+uniform vec3 foreground_text_hsb;
 
 out float o_has_color;
 out vec2 o_tex;
@@ -32,6 +33,18 @@ void pass_through_vertex() {
 
 void main() {
   pass_through_vertex();
+
+  // Solids and monochrome glyphs have one constant RGB color per quad.
+  // Convert neutral, unmixed colors once per vertex instead of running
+  // three pow() operations for every pixel on software renderers.
+  if ((has_color == 3.0 || (has_color == 0.0 && foreground_text_hsb == vec3(1.0)))
+      && hsv == vec3(1.0) && mix_value == 0.0) {
+    bvec3 cutoff = lessThan(fg_color.rgb, vec3(0.0031308));
+    vec3 higher = vec3(1.055) * pow(fg_color.rgb, vec3(1.0/2.4)) - vec3(0.055);
+    vec3 lower = fg_color.rgb * vec3(12.92);
+    o_fg_color = vec4(mix(higher, lower, cutoff), fg_color.a);
+    o_has_color = has_color == 3.0 ? 5.0 : 6.0;
+  }
 
   // Use the adjusted cell position to render the quad
   gl_Position = projection * vec4(position, 0.0, 1.0);

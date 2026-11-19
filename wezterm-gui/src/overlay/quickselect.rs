@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use termwiz::cell::{Cell, CellAttributes};
-use termwiz::color::AnsiColor;
+use termwiz::color::{AnsiColor, ColorAttribute};
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::color::ColorPalette;
@@ -254,6 +254,9 @@ mod label_filter_test {
     }
 }
 
+/// QuickSelectArgs label that selects the click-copy indicator.
+pub const CLICK_COPY_LABEL: &str = "click-copy";
+
 pub struct QuickSelectOverlay {
     renderer: Mutex<QuickSelectRenderable>,
     delegate: Arc<dyn Pane>,
@@ -363,6 +366,10 @@ impl QuickSelectOverlay {
         })
     }
 
+    pub fn is_click_copy(&self) -> bool {
+        self.renderer.lock().is_click_copy()
+    }
+
     pub fn viewport_changed(&self, viewport: Option<StableRowIndex>) {
         let mut render = self.renderer.lock();
         if render.viewport != viewport {
@@ -378,6 +385,10 @@ impl QuickSelectOverlay {
 }
 
 impl Pane for QuickSelectOverlay {
+    fn popup_frame(&self) -> Option<mux::pane::PopupFrame> {
+        self.delegate.popup_frame()
+    }
+
     fn pane_id(&self) -> PaneId {
         self.delegate.pane_id()
     }
@@ -411,6 +422,11 @@ impl Pane for QuickSelectOverlay {
         let mods = mods.remove_positional_mods();
         match (key, mods) {
             (KeyCode::Escape, KeyModifiers::NONE) => self.renderer.lock().close(),
+            // CLICK COPY has no labels to type: q leaves it, as q leaves
+            // tmux's copy mode.
+            (KeyCode::Char('q'), KeyModifiers::NONE) if self.is_click_copy() => {
+                self.renderer.lock().close()
+            }
             (KeyCode::UpArrow, KeyModifiers::NONE)
             | (KeyCode::Enter, KeyModifiers::NONE)
             | (KeyCode::Char('p'), KeyModifiers::CTRL) => {
@@ -542,6 +558,10 @@ impl Pane for QuickSelectOverlay {
         self.delegate.get_current_working_dir(policy)
     }
 
+    fn copy_user_vars(&self) -> std::collections::HashMap<String,String> {
+        self.delegate.copy_user_vars()
+    }
+
     fn get_cursor_position(&self) -> StableCursorPosition {
         // move to the search box
         let renderer = self.renderer.lock();
@@ -549,7 +569,12 @@ impl Pane for QuickSelectOverlay {
             x: 8 + wezterm_term::unicode_column_width(&renderer.selection, None),
             y: renderer.compute_search_row(),
             shape: termwiz::surface::CursorShape::SteadyBlock,
-            visibility: termwiz::surface::CursorVisibility::Visible,
+            // Click copy has no search input: its bar is only an indicator.
+            visibility: if renderer.is_click_copy() {
+                termwiz::surface::CursorVisibility::Hidden
+            } else {
+                termwiz::surface::CursorVisibility::Visible
+            },
         }
     }
 
@@ -622,31 +647,14 @@ impl Pane for QuickSelectOverlay {
                 for (idx, line) in lines.iter_mut().enumerate() {
                     let mut line: Line = line.clone();
                     if disable_attr {
-                        line.cells_mut_for_attr_changes_only()
-                            .iter_mut()
-                            .for_each(|cell| cell.attrs_mut().clear());
+                        remove_styling_keep_images(&mut line);
                         line.clear_appdata();
                     }
                     let stable_idx = idx as StableRowIndex + first_row;
                     self.renderer.dirty_results.remove(stable_idx);
-                    if stable_idx == self.search_row {
+                    if stable_idx == self.search_row && !(config.copy_mode_pane_status && self.renderer.is_click_copy()) {
                         // Replace with search UI
-                        let rev = CellAttributes::default().set_reverse(true).clone();
-                        line.fill_range(0..self.dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
-                        line.overlay_text_with_attribute(
-                            0,
-                            &format!(
-                                "Select: {}  (type highlighted prefix to {}, uppercase pastes, ESC to cancel)",
-                                self.renderer.selection,
-                                if self.renderer.args.label.is_empty() {
-                                    "copy"
-                                } else {
-                                    &self.renderer.args.label
-                                },
-                            ),
-                            rev,
-                            SEQ_ZERO,
-                        );
+                        self.renderer.render_bar(&mut line, self.dims.cols);
                         self.renderer.last_bar_pos = Some(self.search_row);
                         line.clear_appdata();
                     } else if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
@@ -721,30 +729,13 @@ impl Pane for QuickSelectOverlay {
         let search_row = renderer.compute_search_row();
         for (idx, line) in lines.iter_mut().enumerate() {
             if disable_attr {
-                line.cells_mut_for_attr_changes_only()
-                    .iter_mut()
-                    .for_each(|cell| cell.attrs_mut().clear());
+                remove_styling_keep_images(line);
             }
             let stable_idx = idx as StableRowIndex + top;
             renderer.dirty_results.remove(stable_idx);
-            if stable_idx == search_row {
+            if stable_idx == search_row && !(renderer.config.copy_mode_pane_status && renderer.is_click_copy()) {
                 // Replace with search UI
-                let rev = CellAttributes::default().set_reverse(true).clone();
-                line.fill_range(0..dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
-                line.overlay_text_with_attribute(
-                    0,
-                    &format!(
-                        "Select: {}  (type highlighted prefix to {}, uppercase pastes, ESC to cancel)",
-                        renderer.selection,
-                        if renderer.args.label.is_empty() {
-                            "copy"
-                        } else {
-                            &renderer.args.label
-                        },
-                    ),
-                    rev,
-                    SEQ_ZERO,
-                );
+                renderer.render_bar(line, dims.cols);
                 renderer.last_bar_pos = Some(search_row);
             } else if let Some(matches) = renderer.by_line.get(&stable_idx) {
                 for m in matches {
@@ -798,7 +789,60 @@ impl Pane for QuickSelectOverlay {
     }
 }
 
+/// quick_select_remove_styling removes colors and text styles. Images
+/// (imgcat) are content, not styling: keep them visible in the overlay.
+fn remove_styling_keep_images(line: &mut Line) {
+    for cell in line.cells_mut_for_attr_changes_only().iter_mut() {
+        let images = cell.attrs().images();
+        cell.attrs_mut().clear();
+        for image in images.into_iter().flatten() {
+            cell.attrs_mut().attach_image(Box::new(image));
+        }
+    }
+}
+
 impl QuickSelectRenderable {
+    /// Click copy (based_copymode) reuses this overlay to hold a native
+    /// selection over a live pane. It has no search; its bar is an indicator
+    /// styled like tmux's own copy-mode marker.
+    fn is_click_copy(&self) -> bool {
+        self.args.label == CLICK_COPY_LABEL
+    }
+
+    fn render_bar(&self, line: &mut Line, cols: usize) {
+        if self.is_click_copy() {
+            if self.config.copy_mode_pane_status {
+                super::copy::render_pane_status(line, cols, " CLICK COPY ", "");
+                return;
+            }
+            let border = CellAttributes::default()
+                .set_foreground(ColorAttribute::PaletteIndex(250))
+                .clone();
+            let marker = CellAttributes::default()
+                .set_foreground(ColorAttribute::PaletteIndex(4))
+                .clone();
+            line.fill_range(0..cols, &Cell::new('─', border), SEQ_ZERO);
+            line.overlay_text_with_attribute(0, "───  CLICK COPY  ───", marker, SEQ_ZERO);
+            return;
+        }
+        let rev = CellAttributes::default().set_reverse(true).clone();
+        line.fill_range(0..cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
+        line.overlay_text_with_attribute(
+            0,
+            &format!(
+                "Select: {}  (type highlighted prefix to {}, uppercase pastes, ESC to cancel)",
+                self.selection,
+                if self.args.label.is_empty() {
+                    "copy"
+                } else {
+                    &self.args.label
+                },
+            ),
+            rev,
+            SEQ_ZERO,
+        );
+    }
+
     fn compute_search_row(&self) -> StableRowIndex {
         let dims = self.delegate.get_dimensions();
         let top = self.viewport.unwrap_or_else(|| dims.physical_top);
@@ -1003,6 +1047,7 @@ impl QuickSelectRenderable {
         let pane_id = self.delegate.pane_id();
         let action = self.args.action.clone();
         let skip_action_on_paste = self.args.skip_action_on_paste;
+        let window = self.window.clone();
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let mux = mux::Mux::get();
@@ -1023,6 +1068,7 @@ impl QuickSelectRenderable {
                         // Ensure that selection doesn't get invalidated when
                         // the overlay is closed
                         selection.seqno = pane.get_current_seqno();
+                        selection.joined_range = selection.range;
                     }
 
                     let text = term_window.selection_text(&pane);
@@ -1041,6 +1087,20 @@ impl QuickSelectRenderable {
                             );
                         }
                     }
+                    // The chosen match stays highlighted for half a second,
+                    // then goes (unless a new selection replaced it).
+                    let chosen = term_window.selection(pane_id).range;
+                    promise::spawn::spawn(async move {
+                        smol::Timer::after(std::time::Duration::from_millis(500)).await;
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            if let Some(pane) = mux::Mux::get().get_pane(pane_id) {
+                                if term_window.selection(pane_id).range == chosen {
+                                    term_window.clear_selection(&pane);
+                                }
+                            }
+                        })));
+                    })
+                    .detach();
                 }
             })));
     }

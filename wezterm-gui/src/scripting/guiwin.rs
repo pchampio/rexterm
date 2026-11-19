@@ -102,6 +102,20 @@ impl UserData for GuiWin {
             this.window.notify(TermWindowNotif::SetRightStatus(status));
             Ok(())
         });
+        methods.add_method("set_status_message", |_, this, status: String| {
+            this.window.notify(TermWindowNotif::SetStatusMessage(status));
+            Ok(())
+        });
+        methods.add_method("set_marked_pane", |_, this, id: Option<PaneId>| {
+            this.window.notify(TermWindowNotif::Apply(Box::new(move |window| {
+                window.set_marked_pane(id);
+            })));
+            Ok(())
+        });
+        methods.add_method("set_tab_bar_rule", |_, this, enabled: bool| {
+            this.window.notify(TermWindowNotif::SetTabBarRule(enabled));
+            Ok(())
+        });
         methods.add_method("set_left_status", |_, this, status: String| {
             this.window.notify(TermWindowNotif::SetLeftStatus(status));
             Ok(())
@@ -150,6 +164,44 @@ impl UserData for GuiWin {
                 Ok(text)
             },
         );
+        methods.add_async_method("selection_state", |lua,this,pane:UserDataRef<MuxPane>| async move {
+            let (tx,rx)=smol::channel::bounded(1);let id=pane.0;
+            this.window.notify(TermWindowNotif::Apply(Box::new(move |window| {
+                let selection=*window.selection(id);tx.try_send(selection).ok();
+            })));
+            let selection=rx.recv().await.map_err(mlua::Error::external)?;
+            let Some(range)=selection.range else{return Ok(mlua::Value::Nil)};
+            let result=lua.create_table()?;result.set("block",selection.rectangular)?;
+            for (name,coordinate) in [("start",range.start),("end",range.end)] {
+                let point=lua.create_table()?;
+                point.set("x",match coordinate.x {crate::selection::SelectionX::Cell(x)=>x,crate::selection::SelectionX::BeforeZero=>0})?;
+                point.set("y",coordinate.y)?;result.set(name,point)?;
+            }
+            Ok(mlua::Value::Table(result))
+        });
+        methods.add_async_method("copy_mode_state", |lua,this,pane:UserDataRef<MuxPane>| async move {
+            let (tx,rx)=smol::channel::bounded(1);let id=pane.0;
+            this.window.notify(TermWindowNotif::Apply(Box::new(move |window| {
+                let state=window.pane_state(id).overlay.as_ref().and_then(|o|o.pane.downcast_ref::<crate::overlay::copy::CopyOverlay>()).map(|o|o.cursor_and_selection());
+                tx.try_send(state).ok();
+            })));
+            let Some((x,y,start,block,viewport,results,pattern,editing,commands))=rx.recv().await.map_err(mlua::Error::external)? else{return Ok(mlua::Value::Nil)};
+            let result=lua.create_table()?;result.set("x",x)?;result.set("y",y)?;result.set("block",block)?;
+            result.set("viewport",viewport)?;result.set("search_results",results)?;result.set("pattern",pattern)?;result.set("editing_search",editing)?;result.set("highlight_commands",commands)?;
+            if let Some((x,y))=start {let selection=lua.create_table()?;selection.set("x",x)?;selection.set("y",y)?;result.set("start",selection)?;}
+            Ok(mlua::Value::Table(result))
+        });
+        methods.add_async_method("click_copy_active", |_, this, pane: UserDataRef<MuxPane>| async move {
+            let (tx, rx) = smol::channel::bounded(1);
+            let id = pane.0;
+            this.window.notify(TermWindowNotif::Apply(Box::new(move |window| {
+                let active = window.pane_state(id).overlay.as_ref()
+                    .and_then(|o| o.pane.downcast_ref::<crate::overlay::QuickSelectOverlay>())
+                    .is_some_and(|o| o.is_click_copy());
+                tx.try_send(active).ok();
+            })));
+            rx.recv().await.map_err(mlua::Error::external)
+        });
         methods.add_async_method("current_event", |lua, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window

@@ -80,6 +80,33 @@ impl GuiFrontEnd {
                 MuxNotification::PaneFocused(pane_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         let mux = Mux::get();
+                        // Remote state can change again before this queued notification
+                        // is handled. Do not undo the newer server focus.
+                        if let Some((domain_id, _, tab_id)) = mux.resolve_pane_id(pane_id) {
+                            // Rex applies window and pane focus atomically with
+                            // its full view. Per-tab fallback notifications can be
+                            // queued while a pane moves to another tab; replaying
+                            // one here would steal focus from that newer view.
+                            if mux.get_domain(domain_id).is_some_and(|d| d.downcast_ref::<mux::rex::RexDomain>().is_some()) {
+                                return;
+                            }
+                            let is_tmux = mux
+                                .get_domain(domain_id)
+                                .map(|d| d.downcast_ref::<mux::tmux::TmuxDomain>().is_some())
+                                .unwrap_or(false);
+                            if is_tmux
+                                && mux
+                                    .get_tab(tab_id)
+                                    .and_then(|t| t.get_active_pane())
+                                    .map(|p| p.pane_id() != pane_id)
+                                    .unwrap_or(true)
+                            {
+                                return;
+                            }
+                        } else {
+                            // Closing a pane can overtake a queued focus update.
+                            return;
+                        }
                         if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
                             log::error!("Error reconciling PaneFocused notification: {err:#}");
                         }

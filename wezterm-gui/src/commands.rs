@@ -615,6 +615,7 @@ fn label_string(action: &KeyAssignment, candidate: String) -> String {
 /// but can also be used to describe user-provided commands
 pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<CommandDef> {
     Some(match action {
+        SetSelectionStyle(_) => return None,
         PasteFrom(ClipboardPasteSource::PrimarySelection) => CommandDef {
             brief: "Paste primary selection".into(),
             doc: "Pastes text from the primary selection".into(),
@@ -798,7 +799,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Help"],
             icon: Some("cod_debug"),
         },
-        InputSelector(_) => CommandDef {
+        InputSelector(_) | PopupMenu(_) | AgentPanel(_) => CommandDef {
             brief: "Prompt the user to choose from a list".into(),
             doc: "Activates the selector overlay and wait for input".into(),
             keys: vec![],

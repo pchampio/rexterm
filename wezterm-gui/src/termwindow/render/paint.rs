@@ -19,6 +19,7 @@ impl crate::TermWindow {
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
+        self.status_animation.set(false);
         // Start with the assumption that we should allow images to render
         self.allow_images = AllowImage::Yes;
 
@@ -112,13 +113,18 @@ impl crate::TermWindow {
             self.last_frame_duration,
             self.fps
         );
+        let count=mux::Mux::get().get_window(self.mux_window_id).map(|w|w.count_tabs()).unwrap_or(0);
+        if count!=self.last_painted_tab_count {
+            self.last_painted_tab_count=count;
+            log::debug!(target:"tab_latency","TAB_PAINTED {count}");
+        }
         metrics::histogram!("gui.paint.impl").record(self.last_frame_duration);
         metrics::histogram!("gui.paint.impl.rate").record(1.);
 
         // If self.has_animation is some, then the last render detected
         // image attachments with multiple frames, so we also need to
         // invalidate the viewport when the next frame is due
-        if self.focused.is_some() {
+        if self.focused.is_some() || self.status_animation.get() {
             if let Some(next_due) = *self.has_animation.borrow() {
                 let prior = self.scheduled_animation.borrow_mut().take();
                 match prior {
@@ -263,11 +269,16 @@ impl crate::TermWindow {
                     .layer_for_zindex_and_sublayer(2, order)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // A pane overlay (click copy, quick select) shows its indicator in the
+        // pane status row, beneath the continuous window tab strip.
+        let pane_overlay = panes
+            .iter()
+            .any(|pos| self.pane_state(pos.pane.pane_id()).overlay.is_some());
         for mut pos in panes {
             // The tiled pane retains its mux selection while a floating pane
             // has focus. Render it as inactive so that its cursor and IME
             // preedit do not duplicate the focused floating pane's input.
-            if !floating_panes.is_empty() {
+            if floating_panes.iter().any(|p| p.is_active) {
                 pos.is_active = false;
             }
             if pos.is_active {
@@ -280,6 +291,34 @@ impl crate::TermWindow {
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
 
+        let active_tab = mux::Mux::get().get_active_tab_for_window(self.mux_window_id);
+        let remote_chrome = active_tab.as_ref().and_then(|t| t.get_remote_chrome());
+        // tmux's border capture is only needed for the frames of tmux floating
+        // panes; separators and the tab strip are drawn natively, so they
+        // follow layout changes in the same frame.
+        let tmux_float_frames = floating_panes
+            .iter()
+            .any(|p| p.pane.has_server_frame() && p.pane.popup_frame().is_none());
+        let tmux_tab = self.tmux_domain_for_window().map(|(tab, _)| tab);
+        let _ = &active_tab;
+        if let Some(tab) = &tmux_tab {
+            let chrome_layer = self.render_state.as_ref().unwrap().layer_for_zindex(1)?;
+            let mut chrome_layers = chrome_layer.quad_allocator();
+            if let (true, Some(chrome)) = (tmux_float_frames, &remote_chrome) {
+                if let Some(local) = chrome.pane.downcast_ref::<mux::localpane::LocalPane>() {
+                    local.set_tmux_strip_hidden(pane_overlay);
+                }
+                self.paint_pane(chrome, &mut chrome_layers)
+                    .context("paint_tmux_chrome")?;
+            }
+            // A pane overlay (click copy, quick select) uses the status row.
+            let strip_shown = !pane_overlay
+                && self
+                    .paint_tmux_window_strip(&mut chrome_layers)
+                    .context("paint_tmux_window_strip")?;
+            self.paint_tmux_separators(tab, strip_shown, &mut chrome_layers)
+                .context("paint_tmux_separators")?;
+        }
         for (floating_pane, float_layer) in floating_panes.into_iter().zip(floating_layers) {
             let mut floating_pane_layers = float_layer.quad_allocator();
             if floating_pane.is_active {
@@ -297,7 +336,7 @@ impl crate::TermWindow {
 
         if let Some(pane) = self.get_active_pane_or_overlay() {
             let splits = self.get_splits();
-            for split in &splits {
+            for split in splits.iter().filter(|_| tmux_tab.is_none()) {
                 self.paint_split(&mut layers, split, &pane)
                     .context("paint_split")?;
             }
@@ -312,9 +351,22 @@ impl crate::TermWindow {
                 .context("paint_tab_bar")?;
         }
 
+        // Draw mode chrome after separators and tabs, in their existing row.
+        // Its text never replaces the last line of a terminal pane.
+        let mode_layer = self.render_state.as_ref().unwrap().layer_for_zindex(4)?;
+        let mut mode_layers = mode_layer.quad_allocator();
+        for pos in self.get_panes_to_render().iter().chain(self.get_floating_panes_to_render().iter()) {
+            self.paint_pane_mode_status(pos, &mut mode_layers)?;
+        }
+        drop(mode_layers);
+
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+        self.paint_strip_hover().context("paint_strip_hover")?;
+        self.paint_agent_panel().context("paint_agent_panel")?;
+        self.paint_split_drag().context("paint_split_drag")?;
+        self.paint_window_overview().context("paint_window_overview")?;
         self.paint_modal().context("paint_modal")?;
 
         Ok(())

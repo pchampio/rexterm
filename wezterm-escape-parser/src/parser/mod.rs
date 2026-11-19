@@ -83,13 +83,25 @@ impl Parser {
         }
     }
 
-    /// advance with tmux parser, bypass VTParse
+    /// Parse control events, retaining events before ST and the ordinary
+    /// bytes after it. A terminator can arrive in the same read as %exit.
     #[cfg(feature = "tmux_cc")]
-    fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {
+    fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> (Vec<Event>, Option<Vec<u8>>) {
         let parser_state = self.state.borrow();
-        let tmux_state = parser_state.tmux_state.as_ref().unwrap();
-        let mut tmux_parser = tmux_state.borrow_mut();
-        return tmux_parser.advance_bytes(bytes);
+        let mut tmux = parser_state.tmux_state.as_ref().unwrap().borrow_mut();
+        let mut events = vec![];
+        for (index, &byte) in bytes.iter().enumerate() {
+            match tmux.advance_byte(byte) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {},
+                Err(remainder) => {
+                    let mut remainder = remainder.to_string().into_bytes();
+                    remainder.extend_from_slice(&bytes[index..]);
+                    return (events, Some(remainder));
+                }
+            }
+        }
+        (events, None)
     }
 
     pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
@@ -97,24 +109,15 @@ impl Parser {
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
         #[cfg(feature = "tmux_cc")]
         if is_tmux_mode {
-            match self.advance_tmux_bytes(bytes) {
-                Ok(tmux_events) => {
-                    callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(
-                        Box::new(tmux_events),
-                    )));
-                }
-                Err(err_buf) => {
-                    // capture bytes cannot be parsed
-                    let unparsed_str = err_buf.to_string().to_owned();
-                    let mut parser_state = self.state.borrow_mut();
-                    parser_state.tmux_state = None;
-                    let mut perform = Performer {
-                        callback: &mut callback,
-                        state: &mut parser_state,
-                    };
-                    self.state_machine
-                        .parse(unparsed_str.as_bytes(), &mut perform);
-                }
+            let (events, remainder) = self.advance_tmux_bytes(bytes);
+            if !events.is_empty() {
+                callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(Box::new(events))));
+            }
+            if let Some(remainder) = remainder {
+                let mut state = self.state.borrow_mut();
+                state.tmux_state = None;
+                let mut perform = Performer { callback: &mut callback, state: &mut state };
+                self.state_machine.parse(&remainder, &mut perform);
             }
             return;
         }
@@ -202,7 +205,10 @@ struct Performer<'a, F: FnMut(Action) + 'a> {
 }
 
 fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
-    if intermediates == &[b'$'] && byte == b'q' {
+    if intermediates == &[b'+'] && byte == b'r' {
+        // A bounded packet from the explicitly launched Rex shell bridge.
+        true
+    } else if intermediates == &[b'$'] && byte == b'q' {
         // DECRQSS
         true
     } else {
@@ -274,7 +280,9 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 
     fn dcs_put(&mut self, data: u8) {
         if let Some(dcs) = self.state.dcs.as_mut() {
-            dcs.data.push(data);
+            if dcs.intermediates != [b'+'] || dcs.byte != b'r' || dcs.data.len() < 128 * 1024 {
+                dcs.data.push(data);
+            }
         } else if let Some(sixel) = self.state.sixel.as_mut() {
             sixel.push(data);
         } else if let Some(tcap) = self.state.get_tcap.as_mut() {
@@ -303,6 +311,8 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     }
 
     fn dcs_unhook(&mut self) {
+        #[cfg(feature = "tmux_cc")]
+        { self.state.tmux_state = None; }
         if let Some(dcs) = self.state.dcs.take() {
             (self.callback)(Action::DeviceControl(
                 DeviceControlMode::ShortDeviceControl(Box::new(dcs)),
@@ -352,6 +362,31 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 #[cfg(all(test, feature = "std"))]
 mod test {
     use super::*;
+    #[test]
+    fn rex_bridge_packet_streaming_and_bound() {
+        let packet=b"\x1bP+r{\"type\":\"hello\"}\x1b\\";
+        for split in 0..=packet.len() {
+            let mut parser=Parser::new();
+            let mut actions=parser.parse_as_vec(&packet[..split]);
+            actions.extend(parser.parse_as_vec(&packet[split..]));
+            let packets:Vec<_>=actions.iter().filter_map(|a|match a {
+                Action::DeviceControl(DeviceControlMode::ShortDeviceControl(dcs))=>Some(dcs),
+                _=>None,
+            }).collect();
+            assert_eq!(packets.len(),1);
+            assert_eq!(packets[0].intermediates,vec![b'+']);
+            assert_eq!(packets[0].byte,b'r');
+            assert_eq!(packets[0].data,b"{\"type\":\"hello\"}".to_vec());
+        }
+        let mut parser=Parser::new();
+        let mut bytes=b"\x1bP+r".to_vec();bytes.extend(vec![b'x';256*1024]);bytes.extend(b"\x1b\\OK");
+        let actions=parser.parse_as_vec(&bytes);
+        let packet=actions.iter().find_map(|a|match a {
+            Action::DeviceControl(DeviceControlMode::ShortDeviceControl(dcs))=>Some(dcs),_=>None,
+        }).unwrap();
+        assert_eq!(packet.data.len(),128*1024);
+        assert!(actions.iter().any(|a|matches!(a,Action::Print('K'))));
+    }
     use crate::color::ColorSpec;
     use crate::csi::{
         CharacterPath, DecPrivateMode, DecPrivateModeCode, Device, Intensity, Mode, Sgr, Underline,
@@ -737,6 +772,31 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "\x1b[!p");
+    }
+
+    #[test]
+    #[cfg(feature = "tmux_cc")]
+    fn tmux_cc_exit_preserves_events_and_shell_bytes_at_every_split() {
+        let bytes = b"\x1bP1000p%begin 1 1 0\r\n%end 1 1 0\r\n%exit detached\r\n\x1b\\shell\r\n";
+        for split in 0..=bytes.len() {
+            let mut parser = Parser::new();
+            let mut actions = vec![];
+            parser.parse(&bytes[..split], |action| actions.push(action));
+            parser.parse(&bytes[split..], |action| actions.push(action));
+            parser.parse(b"ready", |action| actions.push(action));
+            let exits = actions.iter().filter(|action| matches!(action,
+                Action::DeviceControl(DeviceControlMode::Exit))).count();
+            let tmux_exits = actions.iter().filter_map(|action| match action {
+                Action::DeviceControl(DeviceControlMode::TmuxEvents(events)) => Some(events.iter().filter(|e| matches!(e, Event::Exit { .. })).count()),
+                _ => None,
+            }).sum::<usize>();
+            let printed: String = actions.iter().filter_map(|action| match action {
+                Action::Print(c) => Some(*c), _ => None,
+            }).collect();
+            std::assert_eq!(exits, 1, "split {}", split);
+            std::assert_eq!(tmux_exits, 1, "split {}", split);
+            std::assert_eq!(printed, "shellready", "split {}", split);
+        }
     }
 
     #[test]

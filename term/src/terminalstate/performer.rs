@@ -21,7 +21,7 @@ use wezterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
 };
 use wezterm_escape_parser::osc::{
-    ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
+    ChangeColorPair, ColorOrQuery, FinalTermPromptKind, FinalTermSemanticPrompt, ITermProprietary,
     ITermUnicodeVersionOp, Selection,
 };
 use wezterm_escape_parser::{
@@ -118,6 +118,7 @@ impl<'a> Performer<'a> {
         if self.print.is_empty() {
             return;
         }
+        self.prompt_text();
 
         let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
@@ -264,6 +265,9 @@ impl<'a> Performer<'a> {
                 _ => {}
             }
         }
+        if self.editor_redraw != 0 && self.editor_redraw_step(&action) {
+            return;
+        }
         match action {
             Action::Print(c) => self.print(c),
             Action::PrintString(s) => {
@@ -287,9 +291,51 @@ impl<'a> Performer<'a> {
         }
     }
 
+    /// Follow readline's redraw after a resize (see `editor_redraw`).
+    /// Returns true when the action must not run.
+    fn editor_redraw_step(&mut self, action: &Action) -> bool {
+        use wezterm_escape_parser::csi::{Cursor, Edit, EraseInLine};
+        match (self.editor_redraw, action) {
+            // readline first goes down to the last row of its line.
+            (1, Action::Control(ControlCode::LineFeed)) => {}
+            (1, Action::Control(ControlCode::CarriageReturn)) => self.editor_redraw = 2,
+            (2, Action::CSI(CSI::Edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine)))) => {
+                self.flush_print();
+                self.erase_editor_line();
+                self.editor_redraw = 3;
+            }
+            // readline then goes up through the rows that it believes the
+            // line had, one cursor-up for each row, and clears each of them
+            // (bash 5.2: CR, cursor-up, erase-to-end-of-line). The cursor is
+            // on the real first row already: it must not move up.
+            (3, Action::CSI(CSI::Cursor(Cursor::Up(count)))) => {
+                let count = *count as usize;
+                self.editor_cursor_up(count);
+                return true;
+            }
+            (3, Action::Control(ControlCode::CarriageReturn))
+            | (3, Action::CSI(CSI::Edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine)))) => {}
+            (_, Action::CSI(CSI::Sgr(_))) => {}
+            // Any other output: start again, for the next redraw of a burst.
+            _ => {
+                let watching = self
+                    .redraw_watch_until
+                    .is_some_and(|until| std::time::Instant::now() < until);
+                self.editor_redraw = u8::from(watching);
+            }
+        }
+        false
+    }
+
     fn device_control(&mut self, ctrl: DeviceControlMode) {
         self.pop_tmux_title_state();
         match &ctrl {
+            DeviceControlMode::ShortDeviceControl(s)
+                if s.byte == b'r' && s.intermediates == [b'+'] => {
+                if let Some(handler) = self.device_control_handler.as_mut() {
+                    handler.handle_device_control(ctrl);
+                }
+            }
             DeviceControlMode::ShortDeviceControl(s) => {
                 match (s.byte, s.intermediates.as_slice()) {
                     (b'q', &[b'$']) => {
@@ -677,6 +723,8 @@ impl<'a> Performer<'a> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
+                self.program_status.reset();
+                self.publish_program_status();
                 let seqno = self.seqno;
                 self.pen = Default::default();
                 self.cursor = Default::default();
@@ -772,6 +820,41 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::SetHyperlink(link) => {
                 self.set_hyperlink(link);
+            }
+            OperatingSystemCommand::Unspecified(unspec)
+                if unspec.first().map(Vec::as_slice) == Some(crate::audio::OSC_CODE) =>
+            {
+                if let Some(player) = self.config.audio_player() {
+                    self.audio.handle(&player, &unspec[1..]);
+                }
+            }
+            OperatingSystemCommand::Unspecified(unspec)
+                if unspec.first().map(Vec::as_slice) == Some(b"7501") =>
+            {
+                if unspec.len() == 2 {
+                    if let Ok(body) = std::str::from_utf8(&unspec[1]) {
+                        if body.trim() == "?" {
+                            // Mirrored terminals suppress this reply; Rex already answered it.
+                            write!(self.writer, "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\").ok();
+                            self.writer.flush().ok();
+                        } else if self.program_status.report(body) {
+                            self.publish_program_status();
+                        }
+                    }
+                }
+            }
+            OperatingSystemCommand::Unspecified(unspec)
+                if unspec.first().map(Vec::as_slice) == Some(b"7777") =>
+            {
+                if let Some((event, value)) = wezterm_program_status::agent_event(&unspec[1..]) {
+                    if event == "clear" {
+                        for event in ["status", "agent", "title", "message", "tool", "subagents", "background_tasks", "session_crons"] {
+                            self.publish_status_var(format!("WEZTERM_AGENT_{}", event.to_uppercase()), String::new());
+                        }
+                    } else {
+                        self.publish_status_var(format!("WEZTERM_AGENT_{}", event.to_uppercase()), value);
+                    }
+                }
             }
             OperatingSystemCommand::Unspecified(unspec) => {
                 if self.config.log_unknown_escape_sequences() {
@@ -870,13 +953,21 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. },
             ) => {
+                self.program_status.prompt_or_exit();
+                self.publish_program_status();
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                self.prompt_marked();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::StartPrompt(_),
+                FinalTermSemanticPrompt::StartPrompt(kind),
             ) => {
+                self.program_status.prompt_or_exit();
+                self.publish_program_status();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                if kind == FinalTermPromptKind::Initial {
+                    self.prompt_started();
+                }
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
@@ -899,6 +990,7 @@ impl<'a> Performer<'a> {
                 FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. },
             ) => {
                 self.pen.set_semantic_type(SemanticType::Output);
+                self.prompt_finished();
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(

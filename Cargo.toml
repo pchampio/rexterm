@@ -1,5 +1,7 @@
 [workspace]
 members = [
+  "wezterm-program-status",
+    "wezterm-rex",
   "bidi",
   "bidi/generate",
   "strip-ansi-escapes",
@@ -279,6 +281,7 @@ zstd = "0.11"
 zvariant = "4.0"
 
 [patch.crates-io]
+ghostty-vt = { path = "deps/ghostty-vt" }
 # We use our own vendored cairo, which has minimal deps and should just
 # build via cargo.
 cairo-sys-rs = {path="deps/cairo", version="0.18.0"}

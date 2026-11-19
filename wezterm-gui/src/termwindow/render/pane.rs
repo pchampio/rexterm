@@ -1,4 +1,4 @@
-use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
@@ -58,7 +58,31 @@ impl crate::TermWindow {
         let global_cursor_fg = self.palette().cursor_fg;
         let global_cursor_bg = self.palette().cursor_bg;
         let config = self.config.clone();
-        let palette = pos.pane.palette();
+        let mut palette = pos.pane.palette();
+        if self.pane_state(pos.pane.pane_id()).marked {
+            let (r,g,b,a)=palette.background.to_tuple_rgba();
+            palette.background=(r*0.94,g*0.94,b*0.94,a).into();
+        }
+        let style=self.pane_state(pos.pane.pane_id()).selection_style.clone();
+        let style=if let Some((until,style))=style {
+            if Instant::now()<until {self.update_next_frame_time(Some(until));Some(style)}
+            else {self.pane_state(pos.pane.pane_id()).selection_style=None;self.quad_generation+=1;None}
+        } else {None};
+        let copy_overlay=pos.pane.is::<crate::overlay::copy::CopyOverlay>();
+        let command_selection=pos.pane.downcast_ref::<crate::overlay::CopyOverlay>().is_some_and(|o|o.is_command_selection());
+        if copy_overlay {
+            if let Some(bg)=config.copy_mode_selection_background {
+                palette.selection_bg=bg.into();
+                palette.selection_fg=(0.,0.,0.,0.).into();
+            }
+        }
+        if pos.pane.downcast_ref::<crate::overlay::CopyOverlay>().is_some_and(|c| c.selection_is_search_match()) {
+            if let Some(bg) = config.resolved_palette.copy_mode_active_highlight_bg { palette.selection_bg = palette.resolve_bg(bg.into()); }
+            if let Some(fg) = config.resolved_palette.copy_mode_active_highlight_fg { palette.selection_fg = palette.resolve_fg(fg.into()); }
+        }
+        if let Some(style)=&style {palette.selection_fg=style.foreground.into();palette.selection_bg=style.background.into();}
+        let selection_bold=(!copy_overlay && config.selection_bold) || style.as_ref().is_some_and(|s|s.bold);
+        let selection_underline=(!copy_overlay && config.selection_underline) || style.as_ref().is_some_and(|s|s.underline);
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -83,8 +107,19 @@ impl crate::TermWindow {
         }
 
         let pane_id = pos.pane.pane_id();
-        let current_viewport = self.get_viewport(pane_id);
-        let dims = pos.pane.get_dimensions();
+        // The overlay updates its viewport synchronously; the window receives
+        // a queued notification. Paint rows and animation from the same anchor
+        // even if a key arrives before that notification is processed.
+        let current_viewport = pos.pane.copy_mode_scroll_position()
+            .map(|(position, _)| -position)
+            .or_else(|| self.get_viewport(pane_id));
+        let mut dims = pos.pane.get_dimensions();
+        if pos.pane.downcast_ref::<crate::overlay::CopyOverlay>().is_some() {
+            log::debug!(target: "copy_scroll", "COPY_PAINTED {} {}", pane_id, current_viewport.unwrap_or(dims.physical_top));
+        }
+        // While a tmux separator is dragged the pane is narrower than its
+        // terminal until tmux resizes it: draw only what fits.
+        dims.cols = dims.cols.min(pos.width.max(1));
 
         let gl_state = self.render_state.as_ref().unwrap();
 
@@ -279,6 +314,20 @@ impl crate::TermWindow {
             (sel.range.clone(), sel.rectangular)
         };
 
+        let mut scroll_position = if self.config.copy_mode_smooth_scrolling && pos.pane.copy_mode_scroll_position().is_some() {
+            pos.pane.copy_mode_scroll_position()
+        } else if self.config.tmux_smooth_scrolling && current_viewport.is_none() {
+            pos.pane.tmux_copy_scroll_position()
+        } else { None };
+        if scroll_position.is_none() { self.pane_state(pane_id).copy_scroll = None; }
+        let buffered_scroll = scroll_position.is_some();
+        let mut scroll_buffer = HeapQuadAllocator::default();
+        let mut cursor_buffer = HeapQuadAllocator::default();
+        let mut plain_buffer = HeapQuadAllocator::default();
+        let mut styled_buffer = HeapQuadAllocator::default();
+        let mut copy_selection = None;
+        let mut cursor_rect = None;
+
         let start = Instant::now();
         let selection_fg = palette.selection_fg.to_linear();
         let selection_bg = palette.selection_bg.to_linear();
@@ -296,7 +345,14 @@ impl crate::TermWindow {
             pos.pane
                 .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);
 
-            struct LineRender<'a, 'b> {
+            struct LineRender<'a> {
+                animate_copy_scroll: bool,
+                native_copy_scroll: bool,
+                search_selection: bool,
+                selection_bold: bool,
+                selection_underline: bool,
+                copy_scroll_position: Option<(isize, usize)>,
+                command_selection: bool,
                 term_window: &'a mut crate::TermWindow,
                 selrange: Option<SelectionRange>,
                 rectangular: bool,
@@ -305,7 +361,12 @@ impl crate::TermWindow {
                 left_pixel_x: f32,
                 pos: &'a PositionedPane,
                 pane_id: PaneId,
-                cursor: &'a StableCursorPosition,
+                cursor: StableCursorPosition,
+                cursor_layers: &'a mut HeapQuadAllocator,
+                plain_layers: &'a mut HeapQuadAllocator,
+                styled_layers: &'a mut HeapQuadAllocator,
+                copy_selection: Option<std::sync::Arc<mux::pane::TmuxCopySelection>>,
+                cursor_rect: Option<(f32, f32, f32, f32)>,
                 palette: &'a ColorPalette,
                 default_bg: LinearRgba,
                 cursor_border_color: LinearRgba,
@@ -318,7 +379,7 @@ impl crate::TermWindow {
                 white_space: TextureRect,
                 filled_box: TextureRect,
                 window_is_transparent: bool,
-                layers: &'a mut TripleLayerQuadAllocator<'b>,
+                layers: &'a mut dyn TripleLayerQuadAllocatorTrait,
                 error: Option<anyhow::Error>,
             }
 
@@ -327,6 +388,13 @@ impl crate::TermWindow {
                 + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
 
             let mut render = LineRender {
+                animate_copy_scroll: buffered_scroll,
+                native_copy_scroll: buffered_scroll && pos.pane.copy_mode_scroll_position().is_some(),
+                search_selection: pos.pane.downcast_ref::<crate::overlay::CopyOverlay>().is_some_and(|c|c.selection_is_search_match()),
+                selection_bold,
+                selection_underline,
+                copy_scroll_position: scroll_position,
+                command_selection,
                 term_window: self,
                 selrange,
                 rectangular,
@@ -335,7 +403,12 @@ impl crate::TermWindow {
                 left_pixel_x,
                 pos,
                 pane_id,
-                cursor: &cursor,
+                cursor,
+                cursor_layers: &mut cursor_buffer,
+                plain_layers: &mut plain_buffer,
+                styled_layers: &mut styled_buffer,
+                copy_selection: None,
+                cursor_rect: None,
                 palette: &palette,
                 cursor_border_color,
                 selection_fg,
@@ -348,30 +421,65 @@ impl crate::TermWindow {
                 white_space,
                 filled_box,
                 window_is_transparent,
-                layers,
+                layers: if scroll_position.is_some() { &mut scroll_buffer } else { layers },
                 error: None,
             };
 
-            impl<'a, 'b> LineRender<'a, 'b> {
+            impl<'a> LineRender<'a> {
                 fn render_line(
                     &mut self,
                     stable_top: StableRowIndex,
                     line_idx: usize,
-                    line: &&mut Line,
+                    line: &Line,
+                    pass: u8,
                 ) -> anyhow::Result<()> {
+                    // A pane narrower than its terminal (tmux separator drag):
+                    // cells past the pane's width are not drawn.
+                    let clipped;
+                    let line = if line.len() > self.dims.cols {
+                        let mut copy = line.clone();
+                        copy.resize(self.dims.cols, 0);
+                        clipped = copy;
+                        &clipped
+                    } else {
+                        line
+                    };
+                    let cursor_pass = pass == 1;
+                    let cursor = if self.copy_scroll_position.is_some() && !cursor_pass {
+                        StableCursorPosition { y: StableRowIndex::MIN, ..self.cursor }
+                    } else { self.cursor };
                     let stable_row = stable_top + line_idx as StableRowIndex;
                     let selrange = self
                         .selrange
                         .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));
+                    let selrange = if self.command_selection {crate::overlay::copy::command_selection_columns(line,selrange)} else {selrange};
                     // Constrain to the pane width!
-                    let selrange = selrange.start..selrange.end.min(self.dims.cols);
+                    let selrange = if self.native_copy_scroll && pass==2 {0..0}
+                        else if self.native_copy_scroll && pass==3 {0..self.dims.cols}
+                        else {selrange.start..selrange.end.min(self.dims.cols)};
 
-                    let (cursor, composing, password_input) = if self.cursor.y == stable_row {
+                    // Selection decoration is a GUI style; it never changes
+                    // application cells or the text copied from the terminal.
+                    let decorated;
+                    let line=if !selrange.is_empty() && (self.selection_bold || self.selection_underline) {
+                        let mut copy=line.clone();
+                        for x in selrange.clone() {
+                            if let Some(cell)=copy.cells_mut_for_attr_changes_only().get_mut(x) {
+                                if self.selection_bold {cell.attrs_mut().set_intensity(wezterm_term::Intensity::Bold);}
+                                if self.selection_underline {cell.attrs_mut().set_underline(wezterm_term::Underline::Single);}
+                            }
+                        }
+                        copy.clear_appdata();
+                        decorated=copy;
+                        &decorated
+                    } else {line};
+
+                    let (cursor_properties, composing, password_input) = if cursor.y == stable_row {
                         (
                             Some(CursorProperties {
                                 position: StableCursorPosition {
                                     y: 0,
-                                    ..*self.cursor
+                                    ..cursor
                                 },
                                 dead_key_or_leader: self.term_window.dead_key_status
                                     != DeadKeyStatus::None
@@ -406,6 +514,15 @@ impl crate::TermWindow {
                         (None, None, false)
                     };
 
+                    if cursor_pass {
+                        let cw = self.term_window.render_metrics.cell_size.width as f32;
+                        let ch = self.term_window.render_metrics.cell_size.height as f32;
+                        let width = line.get_cell(cursor.x).map(|c| c.width()).unwrap_or(1).max(1);
+                        let x = self.term_window.dimensions.pixel_width as f32 / -2. + self.left_pixel_x + cursor.x as f32 * cw;
+                        let y = self.term_window.dimensions.pixel_height as f32 / -2. + self.top_pixel_y + (line_idx + self.pos.top) as f32 * ch;
+                        self.cursor_rect = Some((x, y, x + width as f32 * cw, y + ch));
+                    }
+
                     let shape_hash = self.term_window.shape_hash_for_line(line);
 
                     let quad_key = LineQuadCacheKey {
@@ -417,7 +534,7 @@ impl crate::TermWindow {
                         quad_generation: self.term_window.quad_generation,
                         composing: composing.clone(),
                         selection: selrange.clone(),
-                        cursor,
+                        cursor: cursor_properties,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
                             + (line_idx + self.pos.top) as f32
@@ -445,7 +562,7 @@ impl crate::TermWindow {
                         if !expired && !hover_changed {
                             cached_quad
                                 .layers
-                                .apply_to(self.layers)
+                                .apply_to(match pass { 1 => self.cursor_layers, 2 => self.plain_layers, 3 => self.styled_layers, _ => self.layers })
                                 .context("cached_quad.layers.apply_to")?;
                             self.term_window.update_next_frame_time(cached_quad.expires);
                             return Ok(());
@@ -458,11 +575,11 @@ impl crate::TermWindow {
                     let shape_key = LineToEleShapeCacheKey {
                         shape_hash,
                         shape_generation: quad_key.shape_generation,
-                        composing: if self.cursor.y == stable_row && self.pos.is_active {
+                        composing: if cursor.y == stable_row && self.pos.is_active {
                             if let DeadKeyStatus::Composing(composing) =
                                 &self.term_window.dead_key_status
                             {
-                                Some((self.cursor.x, composing.to_string()))
+                                Some((cursor.x, composing.to_string()))
                             } else {
                                 None
                             }
@@ -482,7 +599,7 @@ impl crate::TermWindow {
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
-                                cursor: &self.cursor,
+                                cursor: &cursor,
                                 palette: &self.palette,
                                 dims: &self.dims,
                                 config: &self.term_window.config,
@@ -516,7 +633,7 @@ impl crate::TermWindow {
                     let expires = self.term_window.has_animation.borrow().as_ref().cloned();
                     self.term_window.update_next_frame_time(next_due);
 
-                    buf.apply_to(self.layers)
+                    buf.apply_to(match pass { 1 => self.cursor_layers, 2 => self.plain_layers, 3 => self.styled_layers, _ => self.layers })
                         .context("HeapQuadAllocator::apply_to")?;
 
                     let quad_value = LineQuadCacheValue {
@@ -539,21 +656,97 @@ impl crate::TermWindow {
                 }
             }
 
-            impl<'a, 'b> WithPaneLines for LineRender<'a, 'b> {
+            impl<'a> WithPaneLines for LineRender<'a> {
+                fn set_tmux_copy_selection(&mut self, selection: Option<std::sync::Arc<mux::pane::TmuxCopySelection>>) {
+                    self.copy_selection = if self.animate_copy_scroll { selection } else { None };
+                }
+                fn set_tmux_copy_scroll_position(&mut self, position: Option<(isize, usize)>, cursor: StableCursorPosition) {
+                    self.copy_scroll_position = if self.animate_copy_scroll { position } else { None };
+                    // Position, viewport and cells belong to one terminal snapshot.
+                    // Preserve the domain's inactive-pane visibility mask.
+                    if self.copy_scroll_position.is_some() {
+                        self.cursor.x = cursor.x;
+                        self.cursor.y = cursor.y;
+                        self.cursor.shape = cursor.shape;
+                        if self.cursor.visibility == termwiz::surface::CursorVisibility::Visible {
+                            self.cursor.visibility = cursor.visibility;
+                        }
+                    }
+                }
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                    if self.native_copy_scroll {
+                        if let Some(range)=self.selrange {
+                            let column=|x:crate::selection::SelectionX|match x {crate::selection::SelectionX::Cell(x)=>x.min(self.dims.cols.saturating_sub(1)) as i64,crate::selection::SelectionX::BeforeZero=>0};
+                            self.copy_selection=Some(std::sync::Arc::new(mux::pane::TmuxCopySelection {
+                                endpoints:[column(range.start.x),(range.start.y-stable_top) as i64,column(range.end.x),(range.end.y-stable_top) as i64,i64::from(self.rectangular),1,0,i64::from(!self.search_selection)],
+                                plain:Vec::new(),styled:Vec::new(),
+                            }));
+                            for pass in [2,3] {
+                                for (line_idx,line) in lines.iter().enumerate() {
+                                    if let Err(err)=self.render_line(stable_top,line_idx,line,pass) {self.error.replace(err);return;}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(selection) = self.copy_selection.clone() {
+                        for (pass, variant) in [(2, &selection.plain), (3, &selection.styled)] {
+                            for (line_idx, line) in variant.iter().enumerate() {
+                                if let Err(err) = self.render_line(stable_top, line_idx, line, pass) {
+                                    self.error.replace(err); return;
+                                }
+                            }
+                        }
+                    }
                     for (line_idx, line) in lines.iter().enumerate() {
-                        if let Err(err) = self.render_line(stable_top, line_idx, line) {
+                        if let Err(err) = self.render_line(stable_top, line_idx, line, 0) {
                             self.error.replace(err);
                             return;
+                        }
+                        if self.copy_scroll_position.is_some()
+                            && self.cursor.visibility == termwiz::surface::CursorVisibility::Visible
+                            && self.cursor.y == stable_top + line_idx as isize {
+                            if let Err(err) = self.render_line(stable_top, line_idx, line, 1) {
+                                self.error.replace(err);
+                                return;
+                            }
                         }
                     }
                 }
             }
 
             pos.pane.with_lines_mut(stable_range.clone(), &mut render);
+            if buffered_scroll { scroll_position = render.copy_scroll_position; cursor_rect = render.cursor_rect; copy_selection = render.copy_selection.clone(); }
             if let Some(error) = render.error.take() {
                 return Err(error).context("error while calling with_lines_mut");
             }
+        }
+
+        if let Some((position, rows)) = scroll_position {
+            let now = Instant::now();
+            let height = self.render_metrics.cell_size.height as f32;
+            let top = self.dimensions.pixel_height as f32 / -2. + top_pixel_y + pos.top as f32 * height;
+            let bottom = top + rows as f32 * height;
+            let geometry = (pos.left, pos.top, pos.width, pos.height, self.dimensions.pixel_width, self.dimensions.pixel_height);
+            let generation = (self.quad_generation, self.shape_generation, self.config.generation());
+            let left = self.dimensions.pixel_width as f32 / -2. + padding_left + border.left.get() as f32 + pos.left as f32 * self.render_metrics.cell_size.width as f32;
+            let cell_width = self.render_metrics.cell_size.width as f32;
+            let animated = {
+                let mut state = self.pane_state(pane_id);
+                state.copy_scroll.get_or_insert_with(|| super::copyscroll::CopyScroll::new(position, geometry, generation, now))
+                    .paint(position, scroll_buffer, geometry, generation, now, height, top, bottom, layers, cursor_rect,
+                        copy_selection.map(|s| (s.endpoints, plain_buffer, styled_buffer)),
+                        left, cell_width)?
+            };
+            if let Some(rect) = cursor_rect {
+                cursor_buffer.apply_rect_clipped(layers, 0., rect, true);
+            }
+            if animated {
+                self.update_next_frame_time(Some(now + std::time::Duration::from_millis(8)));
+            }
+        } else if buffered_scroll {
+            // Copy mode ended while this frame was being assembled.
+            self.pane_state(pane_id).copy_scroll = None;
+            scroll_buffer.apply_to(layers)?;
         }
 
         /*

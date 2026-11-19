@@ -148,6 +148,8 @@ impl crate::TermWindow {
                 window_is_transparent: params.window_is_transparent,
                 reverse_video: params.dims.reverse_video,
                 shape_key: &params.shape_key,
+                font: params.font.as_ref(),
+                render_metrics: &params.render_metrics,
             };
 
             let (shaped, invalidate_on_hover) = self.build_line_element_shape(params)?;
@@ -262,7 +264,11 @@ impl crate::TermWindow {
                 // Draw one per cell, otherwise curly underlines
                 // stretch across the whole span
                 for i in 0..cluster_width {
-                    let mut quad = layers.allocate(0).context("layers.allocate(0)")?;
+                    let selected=params.selection.contains(&phys(cluster.first_cell_idx+i,num_cols,direction));
+                    // Selection backgrounds are painted after cell backgrounds.
+                    // Keep selected underlines above that background, with the
+                    // same foreground as the selected text.
+                    let mut quad = layers.allocate(if selected {1}else{0}).context("layers.allocate(underline)")?;
                     let x = gl_x
                         + params.left_pixel_x
                         + if params.use_pixel_positioning {
@@ -276,7 +282,7 @@ impl crate::TermWindow {
                     quad.set_hsv(hsv);
                     quad.set_has_color(false);
                     quad.set_texture(item.underline_tex_rect);
-                    quad.set_fg_color(item.underline_color);
+                    quad.set_fg_color(if selected {params.selection_fg.when_fully_transparent(item.underline_color)} else {item.underline_color});
                 }
             }
         }
@@ -886,8 +892,8 @@ impl crate::TermWindow {
                 style_params.style,
                 &cluster,
                 &gl_state,
-                None,
-                &self.render_metrics,
+                params.font,
+                params.render_metrics,
             )?;
             let pixel_width = glyph_info
                 .iter()

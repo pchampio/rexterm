@@ -91,6 +91,11 @@ pub enum Event {
     Pause {
         pane: TmuxPaneId,
     },
+    /// Companion tmux, client-ui only: base64 text that tmux would have sent
+    /// to a terminal client as OSC 52 (copy-mode copies, load-buffer -w).
+    SetClipboard {
+        data: String,
+    },
     SessionChanged {
         session: TmuxSessionId,
         name: String,
@@ -383,6 +388,11 @@ fn parse_line(line: &[u8]) -> Result<Event> {
             let mut pairs = pair.into_inner();
             let pane = parse_pane_id(pairs.next().ok_or_else(|| format_err!("missing pane id"))?)?;
             Ok(Event::Pause { pane })
+        }
+        Rule::set_clipboard => {
+            let mut pairs = pair.into_inner();
+            let data = pairs.next().ok_or_else(|| format_err!("missing text"))?.as_str().to_owned();
+            Ok(Event::SetClipboard { data })
         }
         Rule::session_changed => {
             let mut pairs = pair.into_inner();
@@ -802,6 +812,7 @@ fn parse_layout_inner(
             | Rule::paste_buffer_changed
             | Rule::paste_buffer_deleted
             | Rule::pause
+            | Rule::set_clipboard
             | Rule::session_changed
             | Rule::session_id
             | Rule::session_renamed
@@ -850,6 +861,13 @@ impl Parser {
     }
 
     pub fn advance_byte(&mut self, c: u8) -> Result<Option<Event>> {
+        // Raw ST ends the outer DCS transport; it is not a job diagnostic.
+        // Preserve ESC here; the caller appends the current backslash and
+        // remaining bytes for the ordinary terminal parser, even across reads.
+        if c == b'\\' && self.buffer.as_slice() == b"\x1b" {
+            self.buffer.clear();
+            bail!("\x1b");
+        }
         if c == b'\n' {
             self.process_line()
         } else {
@@ -924,6 +942,20 @@ impl Parser {
                     None
                 }
             }
+            // tmux writes %set-clipboard while the command that copied
+            // (a copy-mode key) is still running, inside its block.
+            // display-message from a key binding (the user's menu, a config
+            // reload message) is written inside the key's command block.
+            Ok(Event::Message { message }) => {
+                Some(Event::Message { message })
+            }
+            Ok(Event::SetClipboard { data })
+                if data
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') =>
+            {
+                Some(Event::SetClipboard { data })
+            }
             _ => {
                 let begun = self
                     .begun
@@ -968,9 +1000,19 @@ impl Parser {
                 None
             }
             Ok(event) => Some(event),
-            Err(err) => {
-                log::error!("Unrecognized tmux cc line: {}", err);
-                bail!("{}", String::from_utf8_lossy(&self.buffer));
+            Err(err) if self.buffer.starts_with(b"%") => {
+                // Notifications are extensible. An unfamiliar notification
+                // must not end control mode and feed protocol bytes to a PTY.
+                // Guarded command output is handled separately above.
+                log::warn!("Ignoring unsupported tmux notification: {} ({})",
+                    String::from_utf8_lossy(&self.buffer), err);
+                None
+            }
+            Err(_) => {
+                // Jobs started by bindings may print diagnostics without a
+                // command guard (for example: 'script' returned 1). The DCS
+                // transport remains in control mode until its actual exit.
+                Some(Event::Message { message: String::from_utf8_lossy(&self.buffer).into_owned() })
             }
         };
 
@@ -983,6 +1025,25 @@ impl Parser {
 mod tests {
     use super::*;
     use k9::assert_equal as assert_eq;
+
+    #[test]
+    fn nested_session_rename_and_future_notifications_preserve_control_mode() {
+        let mut parser = Parser::new();
+        let events = parser.advance_bytes(b"%unlinked-window-renamed @10 python3\n%future-notification @10 anything\n%begin 1 2 1\n%unknown-is-command-output\n%end 1 2 1\n%output %7 alive\n").unwrap();
+        assert!(matches!(&events[0], Event::UnlinkedWindowRenamed { window: 10 }));
+        assert!(matches!(&events[1], Event::Guarded(g) if g.output == "%unknown-is-command-output\n"));
+        assert!(matches!(&events[2], Event::Output { pane: 7, .. }));
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn unguarded_binding_diagnostic_does_not_end_control_mode() {
+        let mut parser = Parser::new();
+        let events = parser.advance_bytes(b"'plugin' returned 1\n%output %7 still-alive\n%begin 1 2 1\nresponse\n%end 1 2 1\n").unwrap();
+        assert!(matches!(&events[0], Event::Message { message } if message == "'plugin' returned 1"));
+        assert!(matches!(&events[1], Event::Output { pane: 7, .. }));
+        assert!(matches!(&events[2], Event::Guarded(g) if g.output == "response\n"));
+    }
 
     #[test]
     fn test_parse_line() {

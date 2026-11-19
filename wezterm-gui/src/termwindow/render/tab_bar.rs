@@ -7,6 +7,12 @@ use wezterm_term::color::ColorAttribute;
 use window::color::LinearRgba;
 
 impl crate::TermWindow {
+    /// The strip under the tabs (tab_bar_active_underline), in pixels; 0
+    /// without it.
+    pub fn tab_bar_underline_thickness(&self) -> f32 {
+        Self::underline_thickness(&self.config, &self.render_metrics)
+    }
+
     pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         // While any tab shows the indeterminate progress spinner, ask to be
         // repainted when its next frame is due. The paint scheduler wakes us
@@ -103,6 +109,60 @@ impl crate::TermWindow {
             layers,
         )?;
 
+        // Program icons that the tab titles ask for.
+        self.paint_line_icons(layers, &palette, self.tab_bar.line(), 0., tab_bar_y)?;
+
+        // A strip along the bottom of every tab: red under the active tab,
+        // the page colour under the others, so each tab ends above it (the
+        // tiles are drawn above it too). The entry's first cell is the gap
+        // before the tab: the strip starts after it.
+        if let Some(colour) = self.config.tab_bar_active_underline {
+            let cw = self.render_metrics.cell_size.width as f32;
+            let thickness = self.tab_bar_underline_thickness();
+            let colour = colour.to_linear();
+            let page = palette.resolve_bg(ColorAttribute::Default).to_linear();
+            let _ = page;
+            let line = self.tab_bar.line().clone();
+            for entry in self.tab_bar.items() {
+                if let crate::tabbar::TabBarItem::Tab { active, .. } = entry.item {
+                    let (x, width) = entry.span();
+                    if width <= 1 {
+                        continue;
+                    }
+                    let strip_y = tab_bar_y + tab_bar_height - thickness;
+                    if active {
+                        let rect = euclid::rect((x + 1) as f32 * cw, strip_y, (width - 1) as f32 * cw, thickness);
+                        self.filled_rectangle(layers, 2, rect, colour)?;
+                        continue;
+                    }
+                    // An inactive tab keeps its height: the strip takes the
+                    // colour of each cell above it (the grey of the tab).
+                    for cell in line.visible_cells() {
+                        let i = cell.cell_index();
+                        if i > x && i < x + width {
+                            let bg = palette.resolve_bg(cell.attrs().background()).to_linear();
+                            self.filled_rectangle(layers, 2, euclid::rect(i as f32 * cw, strip_y, cw, thickness), bg)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Draw a real one-pixel rule only through unused background cells;
+        // tab blocks, mode labels and transient messages remain unobstructed.
+        if self.tab_bar_rule && self.status_message.is_empty() {
+            let cw = self.render_metrics.cell_size.width as f32;
+            let background = palette.resolve_bg(ColorAttribute::Default);
+            let color = palette.foreground.to_linear().mul_alpha(0.4);
+            for cell in self.tab_bar.line().visible_cells() {
+                if cell.str() == " " && palette.resolve_bg(cell.attrs().background()) == background
+                    && !self.tab_bar.status_text_contains_column(cell.cell_index()) {
+                    self.filled_rectangle(layers, 2,
+                        euclid::rect(cell.cell_index() as f32 * cw, tab_bar_y + self.render_metrics.cell_size.height as f32 / 2., cw, 1.), color)?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -115,8 +175,17 @@ impl crate::TermWindow {
             let font = fontconfig.title_font()?;
             Ok((font.metrics().cell_height.get() as f32 * 1.75).ceil())
         } else {
-            Ok(render_metrics.cell_size.height as f32)
+            // The strip under the tabs (tab_bar_active_underline) is below
+            // the text row: the bar is that much higher.
+            Ok(render_metrics.cell_size.height as f32 + Self::underline_thickness(config, render_metrics))
         }
+    }
+
+    fn underline_thickness(config: &ConfigHandle, render_metrics: &RenderMetrics) -> f32 {
+        if config.tab_bar_active_underline.is_none() {
+            return 0.;
+        }
+        (render_metrics.cell_size.height as f32 * 0.18).round().max(3.)
     }
 
     pub fn tab_bar_pixel_height(&self) -> anyhow::Result<f32> {

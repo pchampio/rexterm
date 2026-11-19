@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+endpoint=${REX_ENDPOINT:-}
+session=${REX_SESSION:-main}
+ssh_host=''
+remote_socket=''
+ssh_args=()
+remote_rex=rex
+remote_config=''
+editor_args=(--skip-editor)
+auto_attach=false
+standalone=false
+while (($#)); do
+  case "$1" in
+    --attach) auto_attach=true; shift;;
+    --install-editor) editor_args=(); shift;;
+    --standalone) standalone=true; editor_args=(--skip-editor); shift;;
+    --minimal) standalone=true; export REX_MINIMAL=1; editor_args=(--skip-editor); shift;;
+    --endpoint) endpoint=${2:?Missing endpoint}; shift 2;;
+    --session) auto_attach=true; session=${2:?Missing session}; shift 2;;
+    --ssh) ssh_host=${2:?Missing SSH host}; shift 2;;
+    --ssh-config) ssh_args+=(-F "${2:?Missing SSH config}"); shift 2;;
+    --remote-rex) remote_rex=${2:?Missing remote rex path}; shift 2;;
+    --remote-config) remote_config=${2:?Missing remote config path}; shift 2;;
+    --remote-socket) remote_socket=${2:?Missing remote socket}; shift 2;;
+    -h|--help)
+      cat <<'HELP'
+Usage: wezterm-rex [--standalone] [--session NAME] [--endpoint unix:///path|https://host]
+       wezterm-rex --ssh HOST [--remote-socket /path] [--ssh-config FILE] [--session NAME]
+
+Starts normal WezTerm with your existing profile and Rex support. No server is
+started until you run rex-attach in its shell (also works after SSH).
+--attach explicitly starts/attaches a private local Rex server.
+With --ssh, connects to Rex through a Unix-socket forward;
+without --remote-socket, starts/finds the remote user's installed Rex server.
+All workflow and appearance settings are in config/wezterm-rex.lua and config/rex/.
+Neovim dotfiles are left alone unless --install-editor is supplied.
+The Lua companion is installed with backups on explicitly selected servers. Direct TLS
+servers need scripts/install-rex-companion.py installed once on the server.
+Use --remote-rex PATH or --remote-config PATH for a non-default remote setup.
+--minimal (or REX_MINIMAL=1) is a diagnostic profile with a fixed test font/theme.
+--standalone keeps your normal appearance and skips Neovim plugin installation.
+Its default local server and state are isolated per installation directory.
+SSH/explicit Unix servers still require installation of the Rex Lua companion.
+HELP
+      exit 0;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; exit 2;;
+  esac
+done
+export LD_LIBRARY_PATH="$root/runtime-preview/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$root/bin:$root/runtime-rex/bin:$PATH"
+if ! $auto_attach && [[ -z $endpoint && -z $ssh_host ]]; then
+  if ((${#editor_args[@]} == 0)); then
+    python3 "$root/scripts/install-rex-companion.py" --endpoint unix:///unused --editor-only >/dev/null
+  fi
+  unset REX_ENDPOINT TMUX TMUX_PANE WEZTERM_UNIX_SOCKET
+  exec "$root/runtime-rex/bin/wezterm" --config-file "$root/config/wezterm-rex.lua" start --always-new-process
+fi
+run_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/wezterm-rex-$(id -u)}/wezterm-rex
+state_dir=${XDG_DATA_HOME:-$HOME/.local/share}/wezterm/rex
+if $standalone && [[ -z $endpoint && -z $ssh_host ]]; then
+  # Rex server start is idempotent: --config cannot change an existing server.
+  # Keep standalone launches away from servers started with another profile,
+  # including older launcher versions, without stopping their running sessions.
+  installation=$(python3 -c 'import hashlib,os,sys; print(hashlib.sha256(os.fsencode(sys.argv[1])).hexdigest()[:12])' "$root")
+  run_dir=$run_dir/standalone-$installation
+  state_dir=$state_dir/standalone-$installation
+fi
+mkdir -p -- "$run_dir"
+chmod 700 -- "$run_dir"
+tunnel_loop=''
+tunnel_dir=''
+own_server=false
+# A new Rex server must not inherit an enclosing tmux session's identity.
+unset TMUX TMUX_PANE WEZTERM_UNIX_SOCKET
+cleanup() { if [[ -n $tunnel_loop ]]; then kill "$tunnel_loop" 2>/dev/null || true; wait "$tunnel_loop" 2>/dev/null || true; fi; if [[ -n $tunnel_dir ]]; then rm -f -- "$tunnel_dir/server.sock"; rmdir -- "$tunnel_dir" 2>/dev/null || true; fi; }
+trap cleanup EXIT INT TERM
+if [[ -n $ssh_host ]]; then
+  export REX_REMOTE_SHELL=1
+  if [[ -z $remote_socket ]]; then
+    remote_command=$(python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "$remote_rex" server start --json)
+    server_json=$(ssh "${ssh_args[@]}" -- "$ssh_host" "$remote_command")
+    remote_socket=$(python3 -c 'import json,sys; e=json.load(sys.stdin)["endpoint"]; assert e.startswith("unix://"), "Remote Rex must expose a Unix socket"; print(e[7:])' <<< "$server_json")
+  fi
+  [[ $remote_socket == /* && $remote_socket != *:* ]] || { printf 'Expected an absolute remote Unix socket path\n' >&2; exit 2; }
+  installer=(python3 "$root/scripts/install-rex-companion.py" "${editor_args[@]}" --ssh "$ssh_host" --endpoint "unix://$remote_socket" --remote-rex "$remote_rex")
+  if ((${#ssh_args[@]})); then installer+=(--ssh-config "${ssh_args[1]}"); fi
+  if [[ -n $remote_config ]]; then installer+=(--config "$remote_config"); fi
+  "${installer[@]}" >/dev/null
+  # Each GUI has an independent tunnel; session buffers live on Rex itself.
+  tunnel_dir=$(mktemp -d "$run_dir/ssh-XXXXXXXX")
+  local_socket=$tunnel_dir/server.sock
+  (
+    child=''
+    trap '[[ -z $child ]] || kill "$child" 2>/dev/null; exit 0' TERM INT
+    while true; do
+      ssh "${ssh_args[@]}" -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -L "$local_socket:$remote_socket" -- "$ssh_host" &
+      child=$!
+      wait "$child" || true
+      sleep 1
+    done
+  ) &
+  tunnel_loop=$!
+  endpoint=unix://$local_socket
+elif [[ -z $endpoint ]]; then
+  own_server=true
+  endpoint=unix://$run_dir/server.sock
+  "$root/runtime-rex/bin/rex" -S "$endpoint" server start \
+    --state-dir "$state_dir" \
+    --config "$root/config/rex/server.lua" >/dev/null
+fi
+# Verify the connection before opening the GUI; never accidentally autostart a
+# default server when an explicitly selected server is unavailable.
+ready=false
+for ((attempt=0;attempt<30;attempt++)); do
+  if "$root/runtime-rex/bin/rex" -S "$endpoint" --autostart=false --timeout 1s api call server.version '{}' >/dev/null 2>&1; then ready=true; break; fi
+  [[ -n $tunnel_loop ]] || break
+  sleep .2
+done
+$ready || { printf 'Cannot connect to Rex at %s\n' "$endpoint" >&2; exit 1; }
+if [[ -z $ssh_host && $endpoint == unix://* ]]; then
+  if $own_server; then
+    "$root/runtime-rex/bin/rex" -S "$endpoint" --autostart=false config reload >/dev/null
+    python3 "$root/scripts/install-rex-companion.py" "${editor_args[@]}" --endpoint "$endpoint" --editor-only >/dev/null
+  else
+    python3 "$root/scripts/install-rex-companion.py" "${editor_args[@]}" --endpoint "$endpoint" --rex "$root/runtime-rex/bin/rex" >/dev/null
+  fi
+fi
+"$root/runtime-rex/bin/rex" -S "$endpoint" --autostart=false api call client.keymap '{}' | python3 -c '
+import json,sys
+names={a["name"] for a in json.load(sys.stdin).get("actions",[])}
+required={"wezterm_save","wezterm_restore","wezterm_capture","wezterm_environment","wezterm_split_context","wezterm_buffer_begin","wezterm_buffer_append","wezterm_buffer_read"}
+if not required <= names: sys.exit("Install scripts/install-rex-companion.py on this Rex server before launching (or connect with --ssh). Missing: "+", ".join(sorted(required-names)))
+'
+export REX_ENDPOINT="$endpoint" REX_SESSION="$session"
+export LD_LIBRARY_PATH="$root/runtime-preview/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+unset TMUX TMUX_PANE WEZTERM_UNIX_SOCKET
+"$root/runtime-rex/bin/wezterm" --config-file "$root/config/wezterm-rex.lua" start --always-new-process

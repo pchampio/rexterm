@@ -4,7 +4,7 @@ use crate::color::{
     ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
 };
 use crate::daemon::DaemonOptions;
-use crate::exec_domain::ExecDomain;
+use crate::exec_domain::{ExecDomain, RexDomain};
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
     FontShaperSelection, FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
@@ -50,6 +50,17 @@ use wezterm_term::TerminalSize;
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic, ConfigMeta)]
 pub struct Config {
+    /// Allow the tmux window list to span pane dividers in control mode.
+    #[dynamic(default)]
+    pub tmux_continuous_window_tabs: bool,
+
+    /// Animate the real tmux copy viewport between server snapshots.
+    #[dynamic(default = "default_true")]
+    pub tmux_smooth_scrolling: bool,
+
+    #[dynamic(default = "default_true")]
+    pub copy_mode_smooth_scrolling: bool,
+
     /// The font size, measured in points
     #[dynamic(default = "default_font_size")]
     pub font_size: f64,
@@ -86,6 +97,18 @@ pub struct Config {
 
     #[dynamic(default)]
     pub log_unknown_escape_sequences: bool,
+
+    /// OSC 7377 audio streams: raw PCM that a program in the terminal (local,
+    /// over SSH or inside tmux) sends to play on this host. See
+    /// term/src/audio.rs and bin/wezterm-audio.
+    #[dynamic(default = "default_true")]
+    pub enable_audio_escape: bool,
+
+    /// Command that plays one audio stream from its stdin. `{rate}`,
+    /// `{channels}` and `{format}` (s16le) are replaced. Empty: the first of
+    /// paplay, pw-cat and aplay that is installed.
+    #[dynamic(default)]
+    pub audio_player: Vec<String>,
 
     #[dynamic(default)]
     pub integrated_title_button_alignment: IntegratedTitleButtonAlignment,
@@ -370,6 +393,32 @@ pub struct Config {
     pub exec_domains: Vec<ExecDomain>,
 
     #[dynamic(default)]
+    pub rex_domains: Vec<RexDomain>,
+    /// Command to start for a new Rex shell; resolved on the Rex host.
+    #[dynamic(default)]
+    pub rex_default_prog: Vec<String>,
+    #[dynamic(default)]
+    pub rex_environment: HashMap<String, String>,
+    /// Preserve key order while a Lua action awaits an RPC or GUI operation.
+    #[dynamic(default)]
+    pub serialize_lua_key_actions: bool,
+
+    #[dynamic(default)]
+    pub selection_bold: bool,
+    #[dynamic(default)]
+    pub copy_mode_selection_background: Option<RgbaColor>,
+    /// Display copy/search mode status in the affected pane separator/status row.
+    #[dynamic(default)]
+    pub copy_mode_pane_status: bool,
+    #[dynamic(default)]
+    pub copy_mode_command_background: Option<RgbaColor>,
+    #[dynamic(default)]
+    pub selection_underline: bool,
+
+    #[dynamic(default)]
+    pub rex_popup_styles: HashMap<String, crate::exec_domain::RexPopupStyle>,
+
+    #[dynamic(default)]
     pub serial_ports: Vec<SerialDomain>,
 
     /// The set of unix domains
@@ -489,6 +538,17 @@ pub struct Config {
 
     #[dynamic(default)]
     pub tab_bar_at_bottom: bool,
+
+    /// A directory of program tiles (PNG). Tab bar text can show a stack of
+    /// them: `OSC 7778 ; icon ; FRONT,BACK1,BACK2 ; CELLS ST` draws FRONT.png
+    /// with NAME-back1.png and NAME-back2.png behind it, in CELLS cells.
+    #[dynamic(default)]
+    pub tab_bar_icon_dir: Option<PathBuf>,
+
+    /// A line of this colour along the bottom of the active tab (the tab
+    /// bar's own tabs, not the status text).
+    #[dynamic(default)]
+    pub tab_bar_active_underline: Option<RgbaColor>,
 
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
@@ -1264,6 +1324,9 @@ impl Config {
             for d in domains {
                 check_domain(&d.name, "ssh domain")?;
             }
+        }
+        for d in &self.rex_domains {
+            check_domain(&d.name, "Rex domain")?;
         }
         for d in &self.exec_domains {
             check_domain(&d.name, "exec domain")?;

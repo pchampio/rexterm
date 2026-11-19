@@ -15,14 +15,14 @@ use mux::tab::TabId;
 use ordered_float::NotNan;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use termwiz::cell::{Cell, CellAttributes};
 use termwiz::color::AnsiColor;
 use termwiz::lineedit::{LineEditBuffer, Movement};
 use termwiz::surface::{CursorVisibility, SequenceNo, SEQ_ZERO};
+use std::time::Duration;
 use unicode_segmentation::*;
 use url::Url;
 use wezterm_term::color::ColorPalette;
@@ -34,14 +34,94 @@ use window::{KeyCode as WKeyCode, Modifiers, WindowOps};
 
 lazy_static::lazy_static! {
     static ref SAVED_PATTERN: Mutex<HashMap<TabId, Pattern>> = Mutex::new(HashMap::new());
+    /// Patterns searched in this GUI, oldest first, for Up/Down in search.
+    static ref SEARCH_HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+}
+
+const SEARCH_HISTORY_LIMIT: usize = 200;
+
+/// Keep `pattern` as the newest entry of the search history.
+fn remember_search(pattern: &str) {
+    if pattern.is_empty() {
+        return;
+    }
+    let mut history = SEARCH_HISTORY.lock();
+    history.retain(|old| old != pattern);
+    history.push(pattern.to_owned());
+    let extra = history.len().saturating_sub(SEARCH_HISTORY_LIMIT);
+    history.drain(..extra);
+}
+
+fn highlight_commands(line: &mut Line, cols: usize, config: &config::ConfigHandle) {
+    if let Some(bg)=config.copy_mode_command_background {
+        if !line.visible_cells().any(|cell| cell.attrs().semantic_type()==SemanticType::Input && !cell.str().trim().is_empty()) {
+            return;
+        }
+        // Shade the complete command row, including continuation rows and
+        // trailing space. Foreground/style attributes remain unchanged.
+        line.resize(cols, SEQ_ZERO);
+        for cell in line.cells_mut_for_attr_changes_only() {
+            cell.attrs_mut().set_background(termwiz::color::ColorAttribute::TrueColorWithDefaultFallback(bg.into()));
+        }
+        // Cloned lines inherit cached shaping data. Do not reuse or overwrite
+        // the underlying terminal's cache for an overlay-only decoration.
+        line.clear_appdata();
+    }
 }
 
 const SEARCH_CHUNK_SIZE: StableRowIndex = 1000;
+
+pub(crate) fn command_selection_columns(line: &Line, mut range: Range<usize>) -> Range<usize> {
+    while range.start < range.end && line.get_cell(range.start).is_some_and(|c| c.attrs().semantic_type()==SemanticType::Prompt) {
+        range.start += 1;
+    }
+    range
+}
+
+pub(crate) fn render_pane_status(line: &mut Line, cols: usize, left: &str, right: &str) {
+    let mut attrs = CellAttributes::default();
+    attrs.set_foreground(termwiz::color::ColorAttribute::TrueColorWithDefaultFallback(termwiz::color::SrgbaTuple::from((0xbc, 0xbc, 0xbc))));
+    line.fill_range(0..cols, &Cell::new('─', attrs.clone()), SEQ_ZERO);
+    let right = termwiz_funcs::truncate_right(right, cols.saturating_sub(8));
+    let right_width = unicode_column_width(&right, None);
+    let searching = left.starts_with('/');
+    let label = if searching { left.to_owned() } else { format!("──  {}  ──", left) };
+    let left = termwiz_funcs::truncate_right(&label, cols.saturating_sub(right_width + if searching { 0 } else { 2 }));
+    let mut accent = attrs.clone();
+    accent.set_foreground(termwiz::color::ColorAttribute::TrueColorWithDefaultFallback(termwiz::color::SrgbaTuple::from((0x00, 0x9f, 0xd7))));
+    line.overlay_text_with_attribute(if searching {0} else {2}, &left, accent, SEQ_ZERO);
+    if right_width > 0 {
+        line.overlay_text_with_attribute(cols.saturating_sub(right_width), &right, attrs, SEQ_ZERO);
+    }
+    line.clear_appdata();
+}
 
 pub struct CopyOverlay {
     delegate: Arc<dyn Pane>,
     render: Arc<Mutex<CopyRenderable>>,
     writer: Mutex<SearchOverlayPatternWriter>,
+}
+
+impl CopyOverlay {
+    pub fn is_command_selection(&self) -> bool { self.render.lock().command_selection }
+    pub fn selection_is_search_match(&self) -> bool {
+        let r = self.render.lock();
+        r.result_pos.and_then(|i| r.results.get(i)).is_some_and(|m|
+            r.cursor.y == m.end_y && r.cursor.x == m.end_x.saturating_sub(1)
+            && r.start == Some(SelectionCoordinate::x_y(m.start_x, m.start_y)))
+    }
+    pub fn status_line(&self, cols: usize) -> (Line, Option<usize>) {
+        let mut r = self.render.lock();
+        let mut line = Line::new(SEQ_ZERO);
+        let position = r.status_position();
+        r.render_pane_status(&mut line, cols, &position);
+        let cursor = r.editing_search.then(|| 1 + unicode_column_width(&r.search_line.get_line()[..r.search_line.get_cursor()], None));
+        (line, cursor)
+    }
+    pub fn cursor_and_selection(&self)->(usize,isize,Option<(usize,isize)>,bool,isize,usize,String,bool,bool) {
+        let r=self.render.lock();
+        (r.cursor.x,r.cursor.y,r.start.map(|p|(match p.x {SelectionX::Cell(x)=>x,SelectionX::BeforeZero=>0},p.y)),r.selection_mode==SelectionMode::Block,r.viewport.unwrap_or(self.delegate.get_dimensions().physical_top),r.results.len(),r.search_line.get_line().to_owned(),r.editing_search,r.highlight_commands)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -63,6 +143,12 @@ struct CopyRenderable {
     start: Option<SelectionCoordinate>,
     selection_mode: SelectionMode,
     viewport: Option<StableRowIndex>,
+    scrolling: bool,
+    viewport_request: Arc<AtomicU64>,
+    highlight_commands: bool,
+    command_selection: bool,
+    status_seqno: Option<SequenceNo>,
+    status_prompts: Vec<StableRowIndex>,
     /// We use this to cancel ourselves later
     window: ::window::Window,
 
@@ -79,9 +165,20 @@ struct CopyRenderable {
     height: usize,
     editing_search: bool,
     result_pos: Option<usize>,
+    reflow_result_pos: Option<usize>,
+    directed_search: Option<bool>,
+    search_origin: (StableRowIndex, usize),
+    search_generation: u64,
+    /// Up/Down in the search editor: the history entry shown, and the text
+    /// that was typed before the first Up.
+    history_pos: Option<usize>,
+    history_draft: String,
+    /// The highlights on screen belong to the previous pattern. They stay
+    /// until the first results of the new search arrive, then are replaced
+    /// in one step: typing a pattern does not blank and redraw them.
+    replace_results: bool,
+    activate_search_results: bool,
     tab_id: TabId,
-    /// Used to debounce queries while the user is typing
-    typing_cookie: usize,
     searching: Option<Searching>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
@@ -89,12 +186,12 @@ struct CopyRenderable {
 
 struct Searching {
     remain: StableRowIndex,
+    pending: VecDeque<Range<StableRowIndex>>,
 }
 
 #[derive(Debug)]
 struct MatchResult {
     range: Range<usize>,
-    result_index: usize,
 }
 
 struct Dimensions {
@@ -128,7 +225,7 @@ impl CopyOverlay {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("failed to clone window handle"))?;
         let dims = pane.get_dimensions();
-        let pattern = if params.pattern.is_empty() {
+        let pattern = if params.pattern.is_empty() && !config::configuration().copy_mode_pane_status {
             SAVED_PATTERN
                 .lock()
                 .get(&tab_id)
@@ -145,6 +242,12 @@ impl CopyOverlay {
             delegate: Arc::clone(pane),
             start: None,
             viewport: term_window.get_viewport(pane.pane_id()),
+            scrolling: false,
+            viewport_request: Arc::new(AtomicU64::new(0)),
+            highlight_commands: false,
+            command_selection: false,
+            status_seqno: None,
+            status_prompts: vec![],
             results: vec![],
             by_line: HashMap::new(),
             dirty_results: RangeSet::default(),
@@ -157,8 +260,15 @@ impl CopyOverlay {
             search_line,
             editing_search: params.editing_search,
             result_pos: None,
+            reflow_result_pos: None,
+            directed_search: None,
+            search_origin: (cursor.y, cursor.x),
+            search_generation: 0,
+            history_pos: None,
+            history_draft: String::new(),
+            replace_results: false,
+            activate_search_results: params.editing_search,
             selection_mode: SelectionMode::Cell,
-            typing_cookie: 0,
             searching: None,
             pending_jump: None,
             last_jump: None,
@@ -191,6 +301,7 @@ impl CopyOverlay {
     pub fn apply_params(&self, params: CopyModeParams) {
         let mut render = self.render.lock();
         render.editing_search = params.editing_search;
+        if params.editing_search {render.activate_search_results=true;render.directed_search=None;}
         if render.get_pattern() != params.pattern {
             render.pattern_type = PatternType::from(&params.pattern);
             render
@@ -217,6 +328,101 @@ impl CopyOverlay {
 }
 
 impl CopyRenderable {
+    /// Select the shell command above, below or at the cursor, and shade
+    /// the commands on screen. The cursor stays on the last cell of the
+    /// command, as the anchor of the next jump.
+    fn select_command(&mut self, direction: isize, prompt_marker: Option<&str>) {
+        use wezterm_term::commands::{find_command, CommandTarget};
+        let zones = self.delegate.get_semantic_zones().unwrap_or_default();
+        // Visual mode (a selection that the user started): extend it by
+        // whole commands instead of selecting one.
+        if self.start.is_some() && !self.command_selection && direction != 0 {
+            self.extend_by_command(&zones, direction);
+            self.set_command_highlight(true);
+            return;
+        }
+        let target = match direction {
+            d if d < 0 => CommandTarget::Previous,
+            0 => CommandTarget::Current,
+            _ => CommandTarget::Next,
+        };
+        let delegate = self.delegate.clone();
+        let found = find_command(&zones, self.cursor.y, target, prompt_marker, &mut |row| {
+            delegate.get_lines(row..row + 1).1.pop()
+        });
+        if let Some(range) = found {
+            self.clear_selection_mode();
+            self.cursor.x = range.start_x;
+            self.cursor.y = range.start_y;
+            self.start.replace(SelectionCoordinate::x_y(range.start_x, range.start_y));
+            self.selection_mode = SelectionMode::Cell;
+            self.cursor.x = range.end_x;
+            self.cursor.y = range.end_y;
+            self.command_selection = true;
+            self.select_to_cursor_pos();
+        }
+        self.set_command_highlight(true);
+    }
+    /// Visual mode: Ctrl-j moves the end of the selection to the end of the
+    /// command's block (its output, up to the row before the next prompt);
+    /// Ctrl-k moves it to the start of the row of the previous command.
+    fn extend_by_command(&mut self, zones: &[wezterm_term::SemanticZone], direction: isize) {
+        let dims = self.delegate.get_dimensions();
+        let last_row = dims.physical_top + dims.viewport_rows as StableRowIndex - 1;
+        let delegate = self.delegate.clone();
+        let blocks = wezterm_term::commands::command_blocks(zones, last_row, &mut |row| {
+            delegate.get_lines(row..row + 1).1.pop()
+        });
+        let y = self.cursor.y;
+        if direction > 0 {
+            let Some(end) = blocks.iter().map(|(_, end)| *end).find(|end| *end > y) else { return; };
+            let line = self.delegate.get_lines(end..end + 1).1.pop();
+            let width = line.map(|l| unicode_column_width(l.as_str().trim_end(), None)).unwrap_or(0);
+            self.cursor.y = end;
+            self.cursor.x = width.saturating_sub(1);
+        } else {
+            let start = blocks
+                .iter()
+                .map(|(range, _)| range.start_y)
+                .filter(|start| *start < y || (*start == y && self.cursor.x > 0))
+                .last();
+            let Some(start) = start else { return; };
+            self.cursor.y = start;
+            self.cursor.x = 0;
+        }
+        self.select_to_cursor_pos();
+    }
+    fn set_command_highlight(&mut self, value: bool) {
+        if self.highlight_commands == value { return; }
+        self.highlight_commands = value;
+        let dims = self.delegate.get_dimensions();
+        let top = self.viewport.unwrap_or(dims.physical_top);
+        for row in top..top + dims.viewport_rows as isize { self.dirty_results.add(row); }
+        self.window.invalidate();
+    }
+    fn status_position(&mut self) -> String {
+        let dims = self.delegate.get_dimensions();
+        let seqno = self.delegate.get_current_seqno();
+        if self.status_seqno != Some(seqno) {
+            self.status_prompts = self.delegate.get_semantic_zones().unwrap_or_default().into_iter()
+                .filter(|z| z.semantic_type == SemanticType::Prompt).map(|z|z.start_y).collect();
+            self.status_seqno = Some(seqno);
+        }
+        let command = self.status_prompts.partition_point(|y| *y <= self.cursor.y);
+        let cmd = if self.status_prompts.is_empty() { String::new() } else { format!("cmd {command}/{}  ", self.status_prompts.len()) };
+        format!(" {cmd}[{}/{}] ", self.cursor.y.saturating_sub(dims.scrollback_top), dims.scrollback_rows)
+    }
+
+    fn render_pane_status(&mut self, line: &mut Line, cols: usize, position: &str) {
+        let pattern = self.get_pattern();
+        let left = if self.editing_search { format!("/{} ", *pattern) } else { " COPY ".to_string() };
+        let right = if !pattern.is_empty() {
+            format!(" {}/{} matches {}", self.result_pos.map(|i| i+1).unwrap_or(0), self.results.len(), position)
+        } else { position.to_owned() };
+        render_pane_status(line, cols, &left, &right);
+
+    }
+
     fn compute_search_row(&self) -> StableRowIndex {
         let dims = self.delegate.get_dimensions();
         let top = self.viewport.unwrap_or_else(|| dims.physical_top);
@@ -233,16 +439,18 @@ impl CopyRenderable {
         self.width = dims.cols;
         self.height = dims.viewport_rows;
 
-        let pos = self.result_pos;
+        // Reflow invalidates every physical selection coordinate. Keep the
+        // query, but never paint an old-width range while the new search runs.
+        self.reflow_result_pos = self.result_pos.or(self.reflow_result_pos);
+        self.clear_selection();
+        self.activate_search_results = true;
         self.update_search();
-        self.result_pos = pos;
     }
 
     fn incrementally_recompute_results(&mut self, mut results: Vec<SearchResult>) {
         results.sort();
         results.reverse();
-        for (result_index, res) in results.iter().enumerate() {
-            let result_index = self.results.len() + result_index;
+        for res in &results {
             for idx in res.start_y..=res.end_y {
                 let range = if idx == res.start_y && idx == res.end_y {
                     // Range on same line
@@ -260,7 +468,6 @@ impl CopyRenderable {
 
                 let result = MatchResult {
                     range,
-                    result_index,
                 };
 
                 let matches = self.by_line.entry(idx).or_insert_with(|| vec![]);
@@ -269,35 +476,29 @@ impl CopyRenderable {
                 self.dirty_results.add(idx);
             }
         }
-        self.results.append(&mut results);
+        // Chunks grow outward from the viewport. Newer chunks precede the
+        // existing descending list; preserve the selected match's identity.
+        if results.first().zip(self.results.first()).is_some_and(|(new,old)|
+            (new.start_y,new.start_x) > (old.start_y,old.start_x)) {
+            if let Some(index)=self.result_pos.as_mut() {*index+=results.len();}
+            results.append(&mut self.results);
+            self.results=results;
+        } else {
+            self.results.append(&mut results);
+        }
     }
 
     fn schedule_update_search(&mut self) {
-        self.typing_cookie += 1;
-        let cookie = self.typing_cookie;
-
-        let window = self.window.clone();
-        let pane_id = self.delegate.pane_id();
-
-        promise::spawn::spawn(async move {
-            smol::Timer::after(Duration::from_millis(350)).await;
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let state = term_window.pane_state(pane_id);
-                if let Some(overlay) = state.overlay.as_ref() {
-                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
-                        let mut r = copy_overlay.render.lock();
-                        if cookie == r.typing_cookie {
-                            r.update_search();
-                        }
-                    }
-                }
-            })));
-            anyhow::Result::<()>::Ok(())
-        })
-        .detach();
+        // Searching runs against the client's terminal in bounded chunks.
+        // Start immediately: waiting for typing to stop makes incremental
+        // highlighting lag every keystroke. Generation checks discard old work.
+        self.reflow_result_pos = None;
+        self.update_search();
     }
 
     fn update_search(&mut self) {
+        self.search_generation+=1;
+        let generation=self.search_generation;
         for idx in self.by_line.keys() {
             self.dirty_results.add(*idx);
         }
@@ -305,9 +506,8 @@ impl CopyRenderable {
             self.dirty_results.add(*idx);
         }
 
-        self.results.clear();
-        self.by_line.clear();
-        self.result_pos.take();
+        // Keep the current highlights (see `replace_results`).
+        self.replace_results = true;
 
         SAVED_PATTERN.lock().insert(self.tab_id, self.get_pattern());
 
@@ -322,12 +522,26 @@ impl CopyRenderable {
             let dims = pane.get_dimensions();
 
             let end = dims.scrollback_top + dims.scrollback_rows as StableRowIndex;
-            let range = end
-                .saturating_sub(SEARCH_CHUNK_SIZE)
-                .max(dims.scrollback_top)..end;
-
+            let top=self.viewport.unwrap_or(dims.physical_top).clamp(dims.scrollback_top,end);
+            let range=top..(top+dims.viewport_rows as StableRowIndex).min(end);
+            let mut above=VecDeque::new();let mut below=VecDeque::new();
+            let mut edge=range.start;
+            while edge>dims.scrollback_top {
+                let start=(edge-SEARCH_CHUNK_SIZE).max(dims.scrollback_top);
+                above.push_back(start..edge);edge=start;
+            }
+            edge=range.end;
+            while edge<end {
+                let next=(edge+SEARCH_CHUNK_SIZE).min(end);
+                below.push_back(edge..next);edge=next;
+            }
+            // Search visible text first, then expand in the search direction.
+            // Text below a scrolled-back viewport must not delay its preview.
+            let pending=if self.directed_search==Some(true) {
+                below.extend(above);below
+            } else {above.extend(below);above};
             self.searching.replace(Searching {
-                remain: range.start - dims.scrollback_top,
+                remain: pending.iter().map(|r| r.end-r.start).sum(), pending,
             });
 
             promise::spawn::spawn(async move {
@@ -342,7 +556,7 @@ impl CopyRenderable {
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                             let mut r = copy_overlay.render.lock();
-                            r.processed_search_chunk(pattern, results.take().unwrap(), range);
+                            r.processed_search_chunk(generation, pattern, results.take().unwrap(), range);
                         }
                     }
                 })));
@@ -352,6 +566,10 @@ impl CopyRenderable {
             .detach();
         } else {
             self.searching.take();
+            self.replace_results = false;
+            self.results.clear();
+            self.by_line.clear();
+            self.result_pos.take();
             self.clear_selection();
         }
         self.window.invalidate();
@@ -359,18 +577,34 @@ impl CopyRenderable {
 
     fn processed_search_chunk(
         &mut self,
+        generation: u64,
         pattern: Pattern,
-        results: Vec<SearchResult>,
+        mut results: Vec<SearchResult>,
         range: Range<StableRowIndex>,
     ) {
         self.window.invalidate();
-        if pattern != self.get_pattern() {
+        if generation != self.search_generation || pattern != self.get_pattern() {
             return;
+        }
+        // Native logical-line search can expand past a physical chunk edge.
+        // Assign each match to the chunk containing its start, exactly once.
+        results.retain(|result| range.contains(&result.start_y));
+        if std::mem::take(&mut self.replace_results) {
+            // The first results of this pattern replace the old ones.
+            for idx in self.by_line.keys() {
+                self.dirty_results.add(*idx);
+            }
+            self.results.clear();
+            self.by_line.clear();
+            self.result_pos.take();
+            if results.is_empty() {
+                self.clear_selection();
+            }
         }
         let is_first = self.results.is_empty();
         self.incrementally_recompute_results(results);
 
-        if is_first {
+        if is_first && self.activate_search_results && self.directed_search.is_none() && self.reflow_result_pos.is_none() {
             if !self.results.is_empty() {
                 self.activate_match_number(0);
             } else {
@@ -379,8 +613,38 @@ impl CopyRenderable {
             }
         }
 
-        let dims = self.delegate.get_dimensions();
-        if range.start == dims.scrollback_top {
+        // A backwards search can select its closest match as soon as that
+        // chunk arrives. Previously selection waited for the entire history,
+        // even when the matching text was already in the visible viewport.
+        if self.result_pos.is_none() && self.activate_search_results && self.reflow_result_pos.is_none() {
+            if let Some(forward) = self.directed_search {
+                let origin = self.search_origin;
+                let selected = if forward {
+                    self.results.iter().rposition(|r| (r.start_y, r.start_x) >= origin)
+                } else {
+                    self.results.iter().position(|r| (r.start_y, r.start_x) <= origin)
+                };
+                if let Some(index) = selected { self.activate_match_number(index); }
+            }
+        }
+        let next=self.searching.as_mut().and_then(|search| {
+            let next=search.pending.pop_front();
+            if let Some(range)=&next {search.remain-=range.end-range.start;}
+            next
+        });
+        if next.is_none() {
+            if let Some(index)=self.reflow_result_pos.take() {
+                if !self.results.is_empty() {self.activate_match_number(index.min(self.results.len()-1));}
+            } else if let Some(forward)=self.directed_search.filter(|_|self.activate_search_results && self.result_pos.is_none()) {
+                let origin=self.search_origin;
+                let selected=if forward {
+                    self.results.iter().rposition(|r|(r.start_y,r.start_x)>=origin)
+                } else {
+                    self.results.iter().position(|r|(r.start_y,r.start_x)<=origin)
+                };
+                if let Some(index)=selected {self.activate_match_number(index);}
+                else {self.cursor.y=origin.0;self.cursor.x=origin.1;self.clear_selection();}
+            }
             self.searching.take();
             return;
         }
@@ -388,16 +652,10 @@ impl CopyRenderable {
         // Search next chunk
         let pane: Arc<dyn Pane> = self.delegate.clone();
         let window = self.window.clone();
-        let end = range.start;
-        let range = end
-            .saturating_sub(SEARCH_CHUNK_SIZE)
-            .max(dims.scrollback_top)..end;
-
-        self.searching.replace(Searching {
-            remain: range.start - dims.scrollback_top,
-        });
+        let range = next.unwrap();
 
         promise::spawn::spawn(async move {
+            smol::Timer::after(Duration::from_millis(1)).await;
             let limit = None;
             log::trace!("Searching for {pattern:?} in {range:?}");
             let results = pane.search(pattern.clone(), range.clone(), limit).await?;
@@ -409,7 +667,7 @@ impl CopyRenderable {
                 if let Some(overlay) = state.overlay.as_ref() {
                     if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                         let mut r = copy_overlay.render.lock();
-                        r.processed_search_chunk(pattern, results.take().unwrap(), range);
+                        r.processed_search_chunk(generation, pattern, results.take().unwrap(), range);
                     }
                 }
             })));
@@ -457,6 +715,7 @@ impl CopyRenderable {
     }
 
     fn select_to_cursor_pos(&mut self) {
+        self.dirty_results.add(self.compute_search_row());
         self.clamp_cursor_to_scrollback();
         if let Some(sel_start) = self.start {
             let cursor = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
@@ -508,7 +767,7 @@ impl CopyRenderable {
         }
     }
 
-    fn adjust_selection(&self, start: SelectionCoordinate, range: SelectionRange) {
+    fn adjust_selection(&mut self, start: SelectionCoordinate, range: SelectionRange) {
         let pane_id = self.delegate.pane_id();
         let window = self.window.clone();
         let mode = self.selection_mode;
@@ -539,7 +798,8 @@ impl CopyRenderable {
         }
     }
 
-    fn adjust_viewport_for_cursor_position(&self) {
+    fn adjust_viewport_for_cursor_position(&mut self) {
+        if self.scrolling { return; }
         let dims = self.dimensions();
 
         if dims.top > self.cursor.y {
@@ -555,23 +815,48 @@ impl CopyRenderable {
             return;
         }
 
-        let bottom_gap = (dims.dims.viewport_rows as isize).saturating_sub(top_gap);
-        if bottom_gap < dims.vertical_gap {
-            self.set_viewport(Some(dims.top + dims.vertical_gap - bottom_gap));
+        // Do not scroll backwards merely because a wheel/Alt scroll left the
+        // cursor in the bottom margin. Only move down once it leaves the view.
+        let rows = dims.dims.viewport_rows.max(1) as isize;
+        if top_gap >= rows {
+            self.set_viewport(Some(self.cursor.y - rows + 1));
         }
     }
 
-    fn set_viewport(&self, row: Option<StableRowIndex>) {
+    fn set_viewport(&mut self, row: Option<StableRowIndex>) {
+        self.viewport = row;
+        let requests = self.viewport_request.clone();
+        let request = requests.fetch_add(1, Ordering::Relaxed) + 1;
         let dims = self.delegate.get_dimensions();
         let pane_id = self.delegate.pane_id();
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.set_viewport(pane_id, row, dims);
+                if requests.load(Ordering::Relaxed) == request {
+                    term_window.set_viewport(pane_id, row, dims);
+                }
             })));
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
+        remember_search(self.search_line.get_line());
+        self.search_generation += 1;
+        self.activate_search_results = false;
+        SAVED_PATTERN.lock().remove(&self.tab_id);
         TermWindow::schedule_cancel_overlay_for_pane(self.window.clone(), self.delegate.pane_id());
+    }
+
+    fn scroll_by_line(&mut self, amount: isize) {
+        self.activate_search_results=false;
+        self.directed_search=None;
+        let dims=self.delegate.get_dimensions();
+        let old=self.viewport.unwrap_or(dims.physical_top);
+        let top=(old+amount).clamp(dims.scrollback_top,dims.physical_top);
+        self.cursor.y+=top-old;
+        self.viewport=Some(top);
+        self.scrolling=true;
+        self.select_to_cursor_pos();
+        self.scrolling=false;
+        self.set_viewport(Some(top));
     }
 
     fn move_by_page(&mut self, amount: f64) {
@@ -587,6 +872,7 @@ impl CopyRenderable {
             let prior = if *cur > 0 {
                 cur - 1
             } else {
+                if self.delegate.is::<mux::rex::RexPane>() { return; }
                 self.results.len() - 1
             };
             self.activate_match_number(prior);
@@ -597,6 +883,7 @@ impl CopyRenderable {
     fn prior_match(&mut self) {
         if let Some(cur) = self.result_pos.as_ref() {
             let next = if *cur + 1 >= self.results.len() {
+                if self.delegate.is::<mux::rex::RexPane>() { return; }
                 0
             } else {
                 *cur + 1
@@ -650,17 +937,70 @@ impl CopyRenderable {
         }
     }
 
+    /// Up (-1) and Down (1) in the search editor walk the search history,
+    /// newest first. Down past the newest entry brings back the typed text.
+    fn search_history(&mut self, direction: isize) {
+        let history = SEARCH_HISTORY.lock().clone();
+        if history.is_empty() {
+            return;
+        }
+        let next = match (self.history_pos, direction < 0) {
+            (None, true) => {
+                self.history_draft = self.search_line.get_line().to_owned();
+                // Skip an entry equal to the text in the editor.
+                let mut pos = history.len() - 1;
+                if history[pos] == self.history_draft && pos > 0 {
+                    pos -= 1;
+                }
+                Some(pos)
+            }
+            (None, false) => return,
+            (Some(pos), true) => Some(pos.saturating_sub(1)),
+            (Some(pos), false) if pos + 1 < history.len() => Some(pos + 1),
+            (Some(_), false) => None,
+        };
+        self.history_pos = next;
+        let text = match next {
+            Some(pos) => history[pos].clone(),
+            None => std::mem::take(&mut self.history_draft),
+        };
+        self.search_line.set_line_and_cursor(&text, text.len());
+        self.schedule_update_search();
+    }
+
     fn clear_pattern(&mut self) {
         self.search_line.clear();
         self.update_search();
     }
 
     fn edit_pattern(&mut self) {
+        self.activate_search_results=true;
         self.editing_search = true;
         self.update_key_table();
     }
 
+    fn directed_pattern(&mut self, forward: bool) {
+        self.directed_search=Some(forward);
+        self.search_origin=(self.cursor.y,self.cursor.x);
+        self.edit_pattern();
+        self.update_search();
+    }
+
+    fn repeat_search(&mut self, reverse: bool) {
+        self.activate_search_results=true;
+        let forward=self.directed_search.unwrap_or(false)^reverse;
+        let origin=(self.cursor.y,self.cursor.x);
+        let selected=if forward {
+            self.results.iter().rposition(|r|(r.start_y,r.start_x)>origin)
+        } else {
+            self.results.iter().position(|r|(r.end_y,r.end_x.saturating_sub(1))<origin)
+        };
+        if let Some(index)=selected {self.activate_match_number(index);}
+    }
+
     fn accept_pattern(&mut self) {
+        remember_search(self.search_line.get_line());
+        self.history_pos = None;
         self.editing_search = false;
         self.update_key_table();
     }
@@ -686,6 +1026,7 @@ impl CopyRenderable {
                         one_shot: false,
                         until_unknown: false,
                         prevent_fallback: false,
+                        passthrough: false,
                     });
                 }
             }
@@ -1103,6 +1444,17 @@ impl CopyRenderable {
 }
 
 impl Pane for CopyOverlay {
+    fn copy_mode_scroll_position(&self) -> Option<(isize, usize)> {
+        let render=self.render.lock();
+        let dims=self.delegate.get_dimensions();
+        let search=!config::configuration().copy_mode_pane_status && (render.editing_search || !render.get_pattern().is_empty());
+        Some((-render.viewport.unwrap_or(dims.physical_top),dims.viewport_rows.saturating_sub(usize::from(search))))
+    }
+
+    fn popup_frame(&self) -> Option<mux::pane::PopupFrame> {
+        self.delegate.popup_frame()
+    }
+
     fn pane_id(&self) -> PaneId {
         self.delegate.pane_id()
     }
@@ -1164,6 +1516,7 @@ impl Pane for CopyOverlay {
         }
 
         if render.editing_search {
+            let key = match key { KeyCode::Char(c) if mods == KeyModifiers::CTRL => KeyCode::Char(c.to_ascii_uppercase()), key => key };
             match (key, mods) {
                 (KeyCode::Char(c), KeyModifiers::NONE)
                 | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
@@ -1243,6 +1596,9 @@ impl Pane for CopyOverlay {
     fn perform_assignment(&self, assignment: &KeyAssignment) -> PerformAssignmentResult {
         use CopyModeAssignment::*;
         let mut render = self.render.lock();
+        if render.editing_search && !matches!(assignment, KeyAssignment::CopyMode(_) | KeyAssignment::SendKey(_)) {
+            return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
+        }
         if render.pending_jump.is_some() {
             // Block key assignments until key_down is called
             // and resolves the next state
@@ -1250,7 +1606,26 @@ impl Pane for CopyOverlay {
         }
         match assignment {
             KeyAssignment::CopyMode(assignment) => {
+                if !matches!(assignment, HighlightCommands(_) | CommandSelection(_) | SelectCommand{..} | SetSelectionMode(_) | ClearSelectionMode) {
+                    render.set_command_highlight(false);
+                }
+                let was_command_selection = render.command_selection;
+                if !matches!(assignment, HighlightCommands(_) | CommandSelection(_) | SelectCommand{..}) { render.command_selection=false; }
                 match assignment {
+                    // v / V right after a command jump: the command becomes
+                    // the start of a visual selection (no toggle).
+                    SetSelectionMode(Some(mode)) if was_command_selection && render.start.is_some() => {
+                        render.selection_mode = *mode;
+                        render.select_to_cursor_pos();
+                    }
+                    SelectCommand{direction,prompt_marker} => render.select_command(*direction,prompt_marker.as_deref()),
+                    CommandSelection(enabled) => { render.command_selection=*enabled; render.window.invalidate(); }
+                    MoveToCoordinates{x,y} => {
+                        let dims=render.delegate.get_dimensions();
+                        render.cursor.x=(*x).min(dims.cols.saturating_sub(1));
+                        render.cursor.y=(*y).clamp(dims.scrollback_top,dims.physical_top+dims.viewport_rows as isize-1);
+                        render.select_to_cursor_pos();
+                    }
                     MoveToViewportBottom => render.move_to_viewport_bottom(),
                     MoveToViewportTop => render.move_to_viewport_top(),
                     MoveToViewportMiddle => render.move_to_viewport_middle(),
@@ -1280,6 +1655,13 @@ impl Pane for CopyOverlay {
                     CycleMatchType => render.cycle_match_type(),
                     ClearPattern => render.clear_pattern(),
                     EditPattern => render.edit_pattern(),
+                    SearchForward => render.directed_pattern(true),
+                    SearchBackward => render.directed_pattern(false),
+                    SearchAgain => render.repeat_search(false),
+                    SearchReverse => render.repeat_search(true),
+                    HighlightCommands(enabled) => render.set_command_highlight(*enabled),
+                    SearchHistory(direction) => render.search_history(*direction),
+                    ScrollByLine(amount) => render.scroll_by_line(*amount),
                     AcceptPattern => render.accept_pattern(),
                     SetSelectionMode(mode) => render.set_selection_mode(mode),
                     ClearSelectionMode => render.clear_selection_mode(),
@@ -1312,6 +1694,10 @@ impl Pane for CopyOverlay {
 
     fn palette(&self) -> ColorPalette {
         self.delegate.palette()
+    }
+
+    fn copy_user_vars(&self) -> std::collections::HashMap<String,String> {
+        self.delegate.copy_user_vars()
     }
 
     fn domain_id(&self) -> DomainId {
@@ -1353,7 +1739,7 @@ impl Pane for CopyOverlay {
                 x: SEARCH_CURSOR_PADDING + cursor,
                 y: renderer.compute_search_row(),
                 shape: termwiz::surface::CursorShape::SteadyBlock,
-                visibility: termwiz::surface::CursorVisibility::Visible,
+                visibility: if config::configuration().copy_mode_pane_status { CursorVisibility::Hidden } else { CursorVisibility::Visible },
             }
         } else {
             renderer.cursor
@@ -1369,7 +1755,9 @@ impl Pane for CopyOverlay {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        self.delegate.get_changed_since(lines, seqno)
+        let mut dirty = self.delegate.get_changed_since(lines.clone(), seqno);
+        dirty.add_set(&self.render.lock().dirty_results);
+        dirty.intersection_with_range(lines)
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -1424,9 +1812,10 @@ impl Pane for CopyOverlay {
                     let mut line: Line = line.clone();
 
                     let stable_idx = idx as StableRowIndex + first_row;
+                    if self.renderer.highlight_commands { highlight_commands(&mut line,self.dims.cols,&config); }
                     self.renderer.dirty_results.remove(stable_idx);
                     let pattern = self.renderer.get_pattern();
-                    if stable_idx == self.search_row
+                    if !config.copy_mode_pane_status && stable_idx == self.search_row
                         && (self.renderer.editing_search || !pattern.is_empty())
                     {
                         // Replace with search UI
@@ -1467,21 +1856,7 @@ impl Pane for CopyOverlay {
                                 if let Some(cell) =
                                     line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
                                 {
-                                    if Some(m.result_index) == self.renderer.result_pos {
-                                        cell.attrs_mut()
-                                            .set_background(
-                                                colors
-                                                    .copy_mode_active_highlight_bg
-                                                    .unwrap_or(AnsiColor::Yellow.into()),
-                                            )
-                                            .set_foreground(
-                                                colors
-                                                    .copy_mode_active_highlight_fg
-                                                    .unwrap_or(AnsiColor::Black.into()),
-                                            )
-                                            .set_reverse(false);
-                                    } else {
-                                        cell.attrs_mut()
+                                    cell.attrs_mut()
                                             .set_background(
                                                 colors
                                                     .copy_mode_inactive_highlight_bg
@@ -1493,7 +1868,6 @@ impl Pane for CopyOverlay {
                                                     .unwrap_or(AnsiColor::Black.into()),
                                             )
                                             .set_reverse(false);
-                                    }
                                 }
                             }
                         }
@@ -1528,9 +1902,10 @@ impl Pane for CopyOverlay {
         let search_row = renderer.compute_search_row();
         for (idx, line) in lines.iter_mut().enumerate() {
             let stable_idx = idx as StableRowIndex + top;
+            if renderer.highlight_commands { highlight_commands(line,dims.cols,&config); }
             renderer.dirty_results.remove(stable_idx);
             let pattern = renderer.get_pattern();
-            if stable_idx == search_row && (renderer.editing_search || !pattern.is_empty()) {
+            if !config.copy_mode_pane_status && stable_idx == search_row && (renderer.editing_search || !pattern.is_empty()) {
                 // Replace with search UI
                 let rev = CellAttributes::default().set_reverse(true).clone();
                 line.fill_range(0..dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
@@ -1559,21 +1934,7 @@ impl Pane for CopyOverlay {
                     for cell_idx in m.range.clone() {
                         if let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
                         {
-                            if Some(m.result_index) == renderer.result_pos {
-                                cell.attrs_mut()
-                                    .set_background(
-                                        colors
-                                            .copy_mode_active_highlight_bg
-                                            .unwrap_or(AnsiColor::Yellow.into()),
-                                    )
-                                    .set_foreground(
-                                        colors
-                                            .copy_mode_active_highlight_fg
-                                            .unwrap_or(AnsiColor::Black.into()),
-                                    )
-                                    .set_reverse(false);
-                            } else {
-                                cell.attrs_mut()
+                            cell.attrs_mut()
                                     .set_background(
                                         colors
                                             .copy_mode_inactive_highlight_bg
@@ -1585,7 +1946,6 @@ impl Pane for CopyOverlay {
                                             .unwrap_or(AnsiColor::Black.into()),
                                     )
                                     .set_reverse(false);
-                            }
                         }
                     }
                 }
@@ -2024,4 +2384,15 @@ pub fn copy_key_table() -> KeyTable {
         table.insert((key, mods), KeyTableEntry { action });
     }
     table
+}
+
+impl Drop for CopyOverlay {
+    fn drop(&mut self) {
+        if config::configuration().copy_mode_pane_status {
+            let mut r = self.render.lock();
+            r.search_generation += 1;
+            r.activate_search_results = false;
+            SAVED_PATTERN.lock().remove(&r.tab_id);
+        }
+    }
 }

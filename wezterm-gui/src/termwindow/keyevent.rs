@@ -19,6 +19,7 @@ pub struct KeyTableStateEntry {
     one_shot: bool,
     until_unknown: bool,
     prevent_fallback: bool,
+    passthrough: bool,
     /// The timeout duration; used when updating the expiration
     timeout_milliseconds: Option<u64>,
 }
@@ -31,6 +32,7 @@ pub struct KeyTableArgs<'a> {
     pub one_shot: bool,
     pub until_unknown: bool,
     pub prevent_fallback: bool,
+    pub passthrough: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,6 +53,7 @@ impl KeyTableState {
             one_shot: args.one_shot,
             until_unknown: args.until_unknown,
             prevent_fallback: args.prevent_fallback,
+            passthrough: args.passthrough,
             timeout_milliseconds: args.timeout_milliseconds,
         });
     }
@@ -93,6 +96,11 @@ impl KeyTableState {
     pub fn current_table(&mut self) -> Option<&str> {
         while self.process_expiration() {}
         self.stack.last().map(|entry| entry.name.as_str())
+    }
+
+    fn passthrough_table(&mut self) -> Option<String> {
+        while self.process_expiration() {}
+        self.stack.last().filter(|e|e.passthrough).map(|e|e.name.clone())
     }
 
     fn lookup_key(
@@ -215,6 +223,19 @@ impl super::TermWindow {
         mods: Modifiers,
         only_key_bindings: OnlyKeyBindings,
     ) -> Option<(KeyTableEntry, Option<String>)> {
+        // Tab-wide selectors have their own bindings just like pane overlays.
+        // Consult them before application-wide pane-navigation shortcuts.
+        if let Some(tab) = mux::Mux::get().get_active_tab_for_window(self.mux_window_id) {
+            if let Some(overlay) = self.tab_state(tab.tab_id()).overlay.as_mut() {
+                if overlay.pane.pane_id() == pane.pane_id() {
+                    if let Some((entry, table_name)) = overlay.key_table_state.lookup_key(
+                        &self.input_map, keycode, mods, only_key_bindings,
+                    ) {
+                        return Some((entry, table_name.map(|s| s.to_string())));
+                    }
+                }
+            }
+        }
         if let Some(overlay) = self.pane_state(pane.pane_id()).overlay.as_mut() {
             if let Some((entry, table_name)) = overlay.key_table_state.lookup_key(
                 &self.input_map,
@@ -248,6 +269,15 @@ impl super::TermWindow {
         is_down: bool,
         key_event: Option<&KeyEvent>,
     ) -> bool {
+        if let Some(table)=self.key_table_state.passthrough_table() {
+            if is_down {
+                if let Some(entry)=self.input_map.lookup_key(keycode,raw_modifiers,Some(&table)) {
+                    self.perform_key_assignment(pane,&entry.action).ok();
+                    return true;
+                }
+            }
+            return false;
+        }
         if is_down && !leader_active {
             // Check to see if this key-press is the leader activating
             if let Some(duration) = self.input_map.is_leader(&keycode, raw_modifiers) {
@@ -407,6 +437,7 @@ impl super::TermWindow {
                             && self.pane_state(pane.pane_id()).overlay.is_none()
                         {
                             self.maybe_scroll_to_bottom_for_input(&pane);
+                self.clear_selection_for_input(&pane);
                         }
                         if is_down
                             && self.config.hide_mouse_cursor_when_typing
@@ -428,6 +459,11 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        // Modal UIs need the cooked key first. A raw global binding must not
+        // consume Ctrl-j/k before the menu/palette can navigate its choices.
+        if self.window_overview.is_some() || self.get_modal().is_some() {
+            return;
+        }
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -597,6 +633,18 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        // The agent panel takes its keys (j/k/l/h/x/H/L, Escape); other
+        // keys go on to the pane.
+        if self.agent_panel.is_some() && window_key.key_is_down
+            && self.agent_panel_key(&window_key.key, window_key.modifiers, context) {
+            return;
+        }
+        if self.window_overview.is_some() {
+            if window_key.key_is_down {
+                self.window_overview_key(&window_key.key, window_key.modifiers);
+            }
+            return;
+        }
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -708,6 +756,7 @@ impl super::TermWindow {
                         && self.pane_state(pane.pane_id()).overlay.is_none()
                     {
                         self.maybe_scroll_to_bottom_for_input(&pane);
+                self.clear_selection_for_input(&pane);
                     }
                     if window_key.key_is_down
                         && self.config.hide_mouse_cursor_when_typing
@@ -739,6 +788,7 @@ impl super::TermWindow {
                     log::error!("failed to send composed text to pane: {err:#}");
                 }
                 self.maybe_scroll_to_bottom_for_input(&pane);
+                self.clear_selection_for_input(&pane);
                 context.invalidate();
             }
             Key::None => {}

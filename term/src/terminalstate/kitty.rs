@@ -69,6 +69,19 @@ impl KittyImageState {
 }
 
 impl TerminalState {
+    pub(crate) fn reset_remote_image_state(&mut self) {self.kitty_img=Default::default();}
+
+    /// Record an image whose cells were imported from a remote snapshot, so
+    /// subsequent native Kitty replacement/deletion commands find it normally.
+    pub fn import_remote_kitty_image(&mut self, image_id: u32, data: Arc<ImageData>,
+                                    first_row: StableRowIndex, rows: usize, cols: usize) {
+        self.kitty_img.record_id_to_data(image_id, data);
+        let entry=self.kitty_img.placements.entry((image_id,None)).or_insert(PlacementInfo{first_row,rows,cols});
+        let end=(entry.first_row+entry.rows as isize).max(first_row+rows as isize);
+        entry.first_row=entry.first_row.min(first_row);
+        entry.rows=(end-entry.first_row) as usize;entry.cols=entry.cols.max(cols);
+    }
+
     fn kitty_img_place(
         &mut self,
         image_id: Option<u32>,
@@ -175,6 +188,15 @@ impl TerminalState {
         log::trace!("{:?}", img);
         if !self.config.enable_kitty_graphics() {
             return Ok(());
+        }
+        if !self.image_files_allowed {
+            let data=match &img {
+                KittyImage::Query{transmit}|KittyImage::TransmitData{transmit,..}
+                |KittyImage::TransmitDataAndDisplay{transmit,..}|KittyImage::TransmitFrame{transmit,..}=>Some(&transmit.data),
+                _=>None,
+            };
+            anyhow::ensure!(data.is_none_or(|d|matches!(d,KittyImageData::Direct(_)|KittyImageData::DirectBin(_))),
+                "remote terminal output cannot read local image files or shared memory");
         }
         let verbosity = img.verbosity();
         match img {

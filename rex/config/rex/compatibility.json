@@ -1,0 +1,818 @@
+{
+  "source": "evidence-ui/binding-inventory.json; ~/dotfiles/tmux.conf; config/tmux/reported-fixes.conf",
+  "all_pending": false,
+  "bindings": [
+    {
+      "binding": "copy-mode-vi Escape",
+      "legacy_command": "bind-key    -T copy-mode-vi   Escape                    set-option -p @_no_copy_border 0 \\; send-keys -X cancel",
+      "existing_test_suite": "guest-advanced-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi /",
+      "legacy_command": "bind-key    -T copy-mode-vi   /                         command-prompt -i -I \"#{pane_search_string}\" -T search -p / { send-keys -X search-backward-incremental \"%%\" }",
+      "existing_test_suite": "guest-advanced-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi ?",
+      "legacy_command": "bind-key    -T copy-mode-vi   ?                         command-prompt -i -I \"#{pane_search_string}\" -T search -p ? { send-keys -X search-forward-incremental \"%%\" }",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi H",
+      "legacy_command": "bind-key    -T copy-mode-vi   H                         send-keys -X start-of-line",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi J",
+      "legacy_command": "bind-key    -T copy-mode-vi   J                         run-shell \"python3 ~/dotfiles/bin/tmux-rectangle-jump.py save #{pane_id}\" \\; if-shell -F \"#{==:#{e|+|:#{E:#{@prompt_lookup_fmt}},1},#{@prompt_total}}\" { if-shell -F \"#{selection_present}\" { send-keys -X history-bottom ;; send-keys -X cursor-up ; send-keys -X start-of-line ;; send-keys \\{ } { send-keys -X history-bottom ;; send-keys -X start-of-line ;; send-keys \\{ } } { if-shell -F \"#{selection_present}\" { if-shell -F \"#{==:#{e|+|:#{E:#{@prompt_lookup_fmt}},2},#{@prompt_total}}\" { send-keys -X cursor-down ;; send-keys -X next-prompt } { send-keys -X next-prompt -o ;; send-keys -X next-prompt -o ;; send-keys -X cursor-up ;; send-keys -X cursor-up ;; send-keys -X cursor-up ;; send-keys -X start-of-line } } { if-shell -F \"#{==:#{E:#{@prompt_lookup_fmt}},#{@prompt_total}}\" {  } { send-keys -X next-prompt -o ;; send-keys -X next-prompt -o ;; send-keys -X cursor-up ;; send-keys -X start-of-line } } } \\; run-shell \"python3 ~/dotfiles/bin/tmux-rectangle-jump.py restore #{pane_id}\" \\; refresh-client -S",
+      "existing_test_suite": "guest-rectangle-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi K",
+      "legacy_command": "bind-key    -T copy-mode-vi   K                         run-shell \"python3 ~/dotfiles/bin/tmux-rectangle-jump.py save #{pane_id}\" \\; send-keys -X previous-prompt -o \\; send-keys -X cursor-up \\; send-keys -X start-of-line \\; run-shell \"python3 ~/dotfiles/bin/tmux-rectangle-jump.py restore #{pane_id}\" \\; refresh-client -S",
+      "existing_test_suite": "guest-prompt-jump-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi L",
+      "legacy_command": "bind-key    -T copy-mode-vi   L                         send-keys -X end-of-line",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi O",
+      "legacy_command": "bind-key    -T copy-mode-vi   O                         send-keys -X copy-pipe-and-cancel \"xargs -I {} sh -c 'input=\\\"{}\\\"; case \\\"\\$input\\\" in *:[0-9]*) file=\\${input%:*}; line=\\${input##*:}; tmux send-keys C-q \\\"\\${EDITOR:-nvim} +\\$line \\\\\\\"\\$file\\\\\\\"\\\" C-m ;; *) tmux send-keys C-q \\\"\\${EDITOR:-nvim} \\\\\\\"\\$input\\\\\\\"\\\" C-m ;; esac'\"",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi V",
+      "legacy_command": "bind-key    -T copy-mode-vi   V                         if-shell -F \"#{selection_present}\" { if-shell -F \"#{||:#{==:#{@mode},#{VISUAL}},#{==:#{@mode},#{VISUAL_BLOCK}}}\" { send-keys -X rectangle-off ;; send-keys -X select-line ;; set-option -g @mode 2 } { send-keys -X clear-selection ;; set-option -g @mode 0 } } { send-keys -X rectangle-off ;; send-keys -X select-line ;; set-option -g @mode 2 }",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi Y",
+      "legacy_command": "bind-key    -T copy-mode-vi   Y                         send-keys -X clear-selection \\; send-keys -X start-of-line \\; send-keys -X jump-forward \\~ \\; send-keys -X cursor-right \\; send-keys -X cursor-right \\; send-keys -X begin-selection \\; send-keys -X end-of-line",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi c",
+      "legacy_command": "bind-key    -T copy-mode-vi   c                         send-keys -X copy-pipe \"env COPY_PROVIDERS=desktop clipboard-provider  copy\" \\; send-keys -X copy-selection",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi o",
+      "legacy_command": "bind-key    -T copy-mode-vi   o                         send-keys -X copy-pipe \"cd #{pane_current_path}; xargs -I {} echo \\\"echo {}\\\" | bash | xargs open-in-vim-pane\" \\; if-shell -F \"#{alternate_on}\" { send-keys -X cancel }",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi q",
+      "legacy_command": "bind-key    -T copy-mode-vi   q                         set-option -p @_no_copy_border 0 \\; send-keys -X cancel",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi s",
+      "legacy_command": "bind-key    -T copy-mode-vi   s                         send-keys -X copy-pipe \"cd #{pane_current_path}; xargs -I {} open 'https://www.google.com/search?q={}'\" \\; if-shell -F \"#{alternate_on}\" { send-keys -X cancel }",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi v",
+      "legacy_command": "bind-key    -T copy-mode-vi   v                         if-shell -F \"#{selection_present}\" { if-shell -F \"#{||:#{==:#{@mode},#{VISUAL_BLOCK}},#{==:#{@mode},#{VISUAL_LINE}}}\" { send-keys -X rectangle-off ;; set-option -g @mode 1 } { send-keys -X rectangle-off ;; send-keys -X clear-selection ;; set-option -g @mode 0 } } { send-keys -X rectangle-off ;; send-keys -X begin-selection ;; set-option -g @mode 1 }",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi y",
+      "legacy_command": "bind-key    -T copy-mode-vi   y                         send-keys -X copy-pipe \"env COPY_PROVIDERS=desktop clipboard-provider  copy\" \\; send-keys -X copy-selection-and-cancel",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi WheelDownPane",
+      "legacy_command": "bind-key    -T copy-mode-vi   WheelDownPane             select-pane \\; if-shell -F \"#{client_control_mode}\" \"send-keys -N 3 -X scroll-down\" \"run-shell -b \\\"python3 ~/dotfiles/bin/tmux-copy-scroll.py #{pane_id} down 3\\\"\"",
+      "existing_test_suite": "guest-smooth-scroll-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/render-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi WheelUpPane",
+      "legacy_command": "bind-key    -T copy-mode-vi   WheelUpPane               select-pane \\; if-shell -F \"#{client_control_mode}\" \"send-keys -N 3 -X scroll-up\" \"run-shell -b \\\"python3 ~/dotfiles/bin/tmux-copy-scroll.py #{pane_id} up 3\\\"\"",
+      "existing_test_suite": "guest-smooth-scroll-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/render-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi M-j",
+      "legacy_command": "bind-key    -T copy-mode-vi   M-j                       if-shell -F \"#{client_control_mode}\" \"send-keys -N 2 -X scroll-down\" \"run-shell -b \\\"python3 ~/dotfiles/bin/tmux-copy-scroll.py #{pane_id} down 2\\\"\"",
+      "existing_test_suite": "guest-smooth-scroll-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/render-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi M-k",
+      "legacy_command": "bind-key    -T copy-mode-vi   M-k                       if-shell -F \"#{client_control_mode}\" \"send-keys -N 2 -X scroll-up\" \"run-shell -b \\\"python3 ~/dotfiles/bin/tmux-copy-scroll.py #{pane_id} up 2\\\"\"",
+      "existing_test_suite": "guest-smooth-scroll-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/render-results.json"
+      ]
+    },
+    {
+      "binding": "copy-mode-vi C-v",
+      "legacy_command": "bind-key    -T copy-mode-vi   C-v                       if-shell -F \"#{selection_present}\" { if-shell -F \"#{||:#{==:#{@mode},#{VISUAL}},#{==:#{@mode},#{VISUAL_LINE}}}\" { send-keys -X rectangle-on ;; set-option -g @mode 3 } { send-keys -X rectangle-off ;; send-keys -X clear-selection ;; set-option -g @mode 0 } } { send-keys -X rectangle-on ;; send-keys -X begin-selection ;; set-option -g @mode 3 }",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "off F12",
+      "legacy_command": "bind-key    -T off            F12                       set-option -u prefix \\; set-option -u key-table \\; set-option -u status-left \\; refresh-client -S",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "prefix Space",
+      "legacy_command": "bind-key    -T prefix         Space                     resize-pane -Z",
+      "existing_test_suite": "guest-tab-transition-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix .",
+      "legacy_command": "bind-key    -T prefix         .                         run-shell \"/home/lab/.tmux-ssh-split/scripts/tmux-ssh-split.sh --get-path\"",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "prefix /",
+      "legacy_command": "bind-key    -T prefix         /                         set-option -p @_no_copy_border 1 \\; copy-mode -H \\; command-prompt -i -I \"#{pane_search_string}\" -T search -p / { set-option -p @_no_copy_border 0 ;; send-keys -X search-backward-incremental \"%%\" }",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix ;",
+      "legacy_command": "bind-key    -T prefix         \\;                        command-prompt",
+      "existing_test_suite": "guest-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix <",
+      "legacy_command": "bind-key -r -T prefix         <                         swap-window -t -",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix >",
+      "legacy_command": "bind-key -r -T prefix         >                         swap-window -t +",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix ?",
+      "legacy_command": "bind-key    -T prefix         ?                         copy-mode -H \\; send-keys -X search-again",
+      "existing_test_suite": "guest-plugin-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "prefix B",
+      "legacy_command": "bind-key    -T prefix         B                         new-window -e COLOR= -e \"PROMPT_PATTERN=\\\\$~\\\\s\" -n last-command-output \"EDITOR=\\\"nvim -\\\" ~/.tmux-last/plugin.sh\"",
+      "existing_test_suite": "guest-plugin-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "prefix D",
+      "legacy_command": "bind-key    -T prefix         D                         detach-client -a",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix K",
+      "legacy_command": "bind-key    -T prefix         K                         copy-mode -H \\; send-keys -X previous-prompt -o \\; send-keys -X cursor-up \\; send-keys -X start-of-line",
+      "existing_test_suite": "guest-prompt-jump-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "prefix P",
+      "legacy_command": "bind-key    -T prefix         P                         command-prompt -I /tmp/tmux.history -p \"save history to filename:\" \"capture-pane -S -; save-buffer %1 ; delete-buffer\"",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix Y",
+      "legacy_command": "bind-key    -T prefix         Y                         copy-mode -H \\; send-keys -X clear-selection \\; send-keys -X start-of-line \\; send-keys -X jump-forward \\~ \\; send-keys -X cursor-right \\; send-keys -X cursor-right \\; send-keys -X begin-selection \\; send-keys -X end-of-line",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "prefix _",
+      "legacy_command": "bind-key    -T prefix         _                         break-pane",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix a",
+      "legacy_command": "bind-key    -T prefix         a                         if-shell -F \"#{&&:#{e|>=:#{?client_height,#{client_height},#{window_height}},31},#{e|>=:#{client_width},44}}\" { display-menu -T \"#[align=centre,fg=default,bg=default] #{host_short} \" -x C -y C \"Python                            \" p \"if-shell -F \\\"#{==:#{session_name},ppt}\\\" {     detach-client  } {       display-popup -b rounded -S \\\"fg=colour001\\\" -E -h 65% -w 65% -T \\\"#[align=centre,fg=color0,bg=color248] Python pad \\\"  \\\"tmux new-session -c \\\\\\\"#{?pane_path,#{pane_path},#{pane_current_path}}\\\\\\\" -A -s ppt bash -c \\\\\\\"tmux set status off; `tmux show-option -gqv \\\"@CONDA_ENV_#S\\\"`python3\\\\\\\"\\\"   }\" \"#{?#{==:#{@CONDA_ENV}#S,},-,}env activate #{@CONDA_ENV}#S\" c \"send-keys \\\" __cd `tmux show-option -gqv \\\"@CONDA_ENV_#S\\\"`../..; source ./env.sh ; __cd -\\\" Enter\" '' \"#{?#{==:#{@CONDA_ENV}#S,},-,}Nvtop\" n \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color002] nvtop \\\" -w 50% -h 50% -E \\\"`tmux show-option -gqv \\\"@CONDA_ENV_#S\\\"`nvtop\\\"\" Htop h \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color002] htop \\\" -w 70% -h 50% -E \\\"htop --sort-key=PERCENT_CPU\\\"\" '' \"Switch client\" t \"display-popup -b rounded -T '#[align=centre,fg=color0,bg=color001] switch client to ' -w 30% -h 30% -E 'python3 /home/lab/dotfiles/bin/tmux-menu.py --switch-session #{q:client_name}'\" \"Switch window\" l \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color001] switch window to \\\" -w 30% -h 30% -E \\\"tmux list-windows -F \\\\\\\"##{window_index} ##{window_name}\\\\\\\"|  sed \\\\\\\"/^$/d\\\\\\\" |fzf --reverse | cut -d \\\\\\\" \\\\\\\" -f 1 | xargs tmux select-window -t \\\"\" \"Break pane\" _ break-pane \"Join Pane\" j \"choose-window 'join-pane -h -s \\\"%%\\\"'\" \"Rename session\" r \"command-prompt -I '#S' -p '(rename session)' \\\"rename-session '%%'\\\"\" \"Detach client\" d detach-client '' \"Find in pane extrakto/fzf\" f \"run-shell \\\"~/.tmux-extrakto/scripts/open.sh #{pane_id}\\\"\" \"Find path:line in pane\" g \"copy-mode -H ; send-keys -X search-backward  '(^|/|<|[[:space:]\\\"])((.|..)|[[:alnum:]~_\\\"-]*)((/[][[:alnum:]_.#$%&+=@\\\"-]+)+([/ \\\"]|.([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?)|[][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)(:[0-9]+)?)|(/[][[:alnum:]_.#$%&+=@\\\"-]+){2,}([/ \\\"]|.([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?)|[][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)(:[0-9]+)?)?|(.|..)/([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?))'\" \"Back to previous prompt\" b \"copy-mode -H ; send-keys -X previous-prompt -o ; send-keys -X cursor-up ; send-keys -X start-of-line\" \"Open last output in nvim\" B \"new-window -e COLOR= -e 'PROMPT_PATTERN=\\\\$~\\\\s' -n last-command-output 'EDITOR=\\\"nvim -\\\" ~/.tmux-last/plugin.sh'\" \"Capture pane\" P \"command-prompt -p 'save history to filename:' -I '/tmp/tmux.history' 'capture-pane -S -; save-buffer %1 ; delete-buffer'\" '' \"Swap Pane Up\" < \"swap-pane -U\" \"Swap Pane Down\" > \"swap-pane -D\" \"#{?pane_marked,Unmark,Mark}\" m \"select-pane -m\" \"#{?pane_marked_set,,-}Swap Marked pane\" s swap-pane \"#{?pane_marked_set,,-}Swap Marked window\" S swap-window '' \"Kill Pane\" k kill-pane \"Kill Window\" K kill-window '' \"Close menu\" q '' } { run-shell -C \"#{?#{e|>=:#{client_width},44},#{?pane_marked_set,#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},31},#{@tmcc-menu-1-31-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},30},#{@tmcc-menu-1-30-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},29},#{@tmcc-menu-1-29-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},28},#{@tmcc-menu-1-28-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},27},#{@tmcc-menu-1-27-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},26},#{@tmcc-menu-1-26-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},25},#{@tmcc-menu-1-25-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},24},#{@tmcc-menu-1-24-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},23},#{@tmcc-menu-1-23-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},22},#{@tmcc-menu-1-22-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},21},#{@tmcc-menu-1-21-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},20},#{@tmcc-menu-1-20-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},19},#{@tmcc-menu-1-19-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},18},#{@tmcc-menu-1-18-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},17},#{@tmcc-menu-1-17-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},16},#{@tmcc-menu-1-16-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},15},#{@tmcc-menu-1-15-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},14},#{@tmcc-menu-1-14-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},13},#{@tmcc-menu-1-13-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},12},#{@tmcc-menu-1-12-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},11},#{@tmcc-menu-1-11-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},10},#{@tmcc-menu-1-10-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},9},#{@tmcc-menu-1-9-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},8},#{@tmcc-menu-1-8-0},run-shell 'python3 /home/lab/dotfiles/bin/tmux-menu.py #{q:client_name} #{pane_id}'}}}}}}}}}}}}}}}}}}}}}}}},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},31},#{@tmcc-menu-0-31-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},30},#{@tmcc-menu-0-30-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},29},#{@tmcc-menu-0-29-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},28},#{@tmcc-menu-0-28-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},27},#{@tmcc-menu-0-27-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},26},#{@tmcc-menu-0-26-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},25},#{@tmcc-menu-0-25-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},24},#{@tmcc-menu-0-24-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},23},#{@tmcc-menu-0-23-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},22},#{@tmcc-menu-0-22-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},21},#{@tmcc-menu-0-21-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},20},#{@tmcc-menu-0-20-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},19},#{@tmcc-menu-0-19-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},18},#{@tmcc-menu-0-18-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},17},#{@tmcc-menu-0-17-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},16},#{@tmcc-menu-0-16-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},15},#{@tmcc-menu-0-15-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},14},#{@tmcc-menu-0-14-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},13},#{@tmcc-menu-0-13-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},12},#{@tmcc-menu-0-12-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},11},#{@tmcc-menu-0-11-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},10},#{@tmcc-menu-0-10-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},9},#{@tmcc-menu-0-9-0},#{?#{e|>=:#{?client_height,#{client_height},#{window_height}},8},#{@tmcc-menu-0-8-0},run-shell 'python3 /home/lab/dotfiles/bin/tmux-menu.py #{q:client_name} #{pane_id}'}}}}}}}}}}}}}}}}}}}}}}}}},run-shell 'python3 /home/lab/dotfiles/bin/tmux-menu.py #{q:client_name} #{pane_id}'}\" }",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix c",
+      "legacy_command": "bind-key    -T prefix         c                         new-window -c \"#{pane_current_path}\"",
+      "existing_test_suite": "guest-tab-transition-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "prefix f",
+      "legacy_command": "bind-key    -T prefix         f                         run-shell \"\\\"/home/lab/.tmux-extrakto/scripts/open.sh\\\" \\\"#{pane_id}\\\"\"",
+      "existing_test_suite": "guest-plugin-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix g",
+      "legacy_command": "bind-key    -T prefix         g                         copy-mode -H \\; send-keys -X search-backward \"(^|/|\\\\<|[[:space:]\\\"])((\\\\.|\\\\.\\\\.)|[[:alnum:]~_\\\"-]*)((/[][[:alnum:]_.#$%&+=@\\\"-]+)+([/ \\\"]|\\\\.([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?)|[][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)(:[0-9]+)?)|(/[][[:alnum:]_.#$%&+=@\\\"-]+){2,}([/ \\\"]|\\\\.([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?)|[][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)(:[0-9]+)?)?|(\\\\.|\\\\.\\\\.)/([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?))\"",
+      "existing_test_suite": "guest-plugin-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "prefix i",
+      "legacy_command": "bind-key    -T prefix         i                         run-shell \"/home/lab/.tmux-ssh-split/scripts/tmux-ssh-split.sh -c '#{pane_current_path}' --keep-remote-cwd --strip-cmd --verbose -v\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "prefix k",
+      "legacy_command": "bind-key    -T prefix         k                         copy-mode -H \\; send-keys -X cursor-up",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix l",
+      "legacy_command": "bind-key    -T prefix         l                         display-popup -E -T \"#[align=centre,fg=color0,bg=color001] switch window to \" -b rounded -h \"30%\" -w \"30%\" \"    tmux list-windows -F '#{window_index} #{window_name}' |    sed '/^$/d' |    fzf --reverse --header jump-to-window |    cut -d ' ' -f 1 |    xargs tmux select-window -t\"",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "prefix m",
+      "legacy_command": "bind-key    -T prefix         m                         set-window-option synchronize-panes \\; run-shell /home/lab/dotfiles/bin/tmux_update_statusbar",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix s",
+      "legacy_command": "bind-key    -T prefix         s                         run-shell \"/home/lab/.tmux-ssh-split/scripts/tmux-ssh-split.sh -c '#{pane_current_path}' --keep-remote-cwd --strip-cmd --verbose -h\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix v",
+      "legacy_command": "bind-key    -T prefix         v                         copy-mode -H",
+      "existing_test_suite": "guest-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "prefix C-r",
+      "legacy_command": "bind-key    -T prefix         C-r                       run-shell /home/lab/.tmux-resurrect/scripts/restore.sh",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix C-s",
+      "legacy_command": "bind-key    -T prefix         C-s                       run-shell /home/lab/.tmux-resurrect/scripts/save.sh",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "prefix C-t",
+      "legacy_command": "bind-key    -T prefix         C-t                       source-file /home/lab/.tmux.conf \\; display-message \"Reloaded ~/.tmux.conf\"",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root F12",
+      "legacy_command": "bind-key    -T root           F12                       set-option prefix None \\; set-option key-table off \\; set-option status-left \"☞  Bound to Remote\" \\; if-shell -F \"#{pane_in_mode}\" \"send-keys -X cancel\" \\; refresh-client -S",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "root WheelDownPane",
+      "legacy_command": "bind-key    -T root           WheelDownPane             if-shell -F \"#{||:#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { if-shell -F \"#{alternate_on}\" { send-keys -N 3 Down } }",
+      "existing_test_suite": "guest-copy-ui-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/render-results.json"
+      ]
+    },
+    {
+      "binding": "root WheelUpPane",
+      "legacy_command": "bind-key    -T root           WheelUpPane               if-shell -F \"#{||:#{pane_in_mode},#{mouse_any_flag}}\" { send-keys -M } { if-shell -F \"#{alternate_on}\" { send-keys -N 3 Up } { copy-mode -He } }",
+      "existing_test_suite": "guest-copy-ui-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/render-results.json"
+      ]
+    },
+    {
+      "binding": "root M-/",
+      "legacy_command": "bind-key    -T root           M-/                       display-menu -T \"#[fg=colour4]Readline Bindings\" -x W -y S '' \"#[fg=colour1]Changing Text\" '' '' '' \"Transpose words\" M-t \"send-keys M-t\" '' \"#[fg=colour1]Cutting and Pasting\" '' '' '' \"Kill (cut) backwards to the start of the line\" C-u \"send-keys C-u\" \"Kill (cut) forwards to the end of the current word\" M-d \"send-keys M-d\" \"Kill (cut) backwards to the start of the current word\" C-w \"send-keys C-w\" \"Yank (paste) the top of the kill ring\" C-y \"send-keys C-y\" \"Rotate the kill ring, and yank (paste) the new top. Only works after a yank\" M-y \"send-keys M-y\" '' \"#[fg=colour1]History\" '' '' '' \"Insert the last argument to the previous command\" M-. \"send-keys M-.\"",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root M-H",
+      "legacy_command": "bind-key    -T root           M-H                       previous-window",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root M-L",
+      "legacy_command": "bind-key    -T root           M-L                       next-window",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root M-g",
+      "legacy_command": "bind-key    -T root           M-g                       if-shell -F \"#{==:#{session_name},scc}\" { detach-client } { display-popup -E -S fg=colour001 -T \"#[align=centre,fg=color0,bg=color248] Scratch pad \" -b rounded -h \"65%\" -w \"65%\" \"tmux new-session -c \\\"#{?pane_path,#{pane_path},#{pane_current_path}}\\\" -A -s scc\" }",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "root M-h",
+      "legacy_command": "bind-key    -T root           M-h                       previous-window",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root M-j",
+      "legacy_command": "bind-key    -T root           M-j                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} opencode nvim fzf claude\" \"send-keys M-j\" \"copy-mode -H\"",
+      "existing_test_suite": "guest-copy-ui-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "root M-k",
+      "legacy_command": "bind-key    -T root           M-k                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} opencode nvim fzf claude\" \"send-keys M-k\" \"copy-mode -H\"",
+      "existing_test_suite": "guest-copy-ui-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/copy-results.json"
+      ]
+    },
+    {
+      "binding": "root M-l",
+      "legacy_command": "bind-key    -T root           M-l                       next-window",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root M-n",
+      "legacy_command": "bind-key    -T root           M-n                       new-window -a -c \"#{pane_current_path}\"",
+      "existing_test_suite": "guest-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/native-smoke-results.json"
+      ]
+    },
+    {
+      "binding": "root M-p",
+      "legacy_command": "bind-key    -T root           M-p                       if-shell -F \"#{==:#{session_name},ppt}\" { detach-client } { display-popup -E -S fg=colour001 -T \"#[align=centre,fg=color0,bg=color248] Python pad \" -b rounded -h \"65%\" -w \"65%\" \"tmux new-session -c \\\"#{?pane_path,#{pane_path},#{pane_current_path}}\\\" -A -s ppt bash -c \\\"tmux set status off; `tmux show-option -gqv @CONDA_ENV_#S`python3\\\"\" }",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json"
+      ]
+    },
+    {
+      "binding": "root M-w",
+      "legacy_command": "bind-key    -T root           M-w                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} opencode\" \"send-keys M-right;send-keys M-left;send-keys C-w\" \"send-keys M-w\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log"
+      ]
+    },
+    {
+      "binding": "root C-b",
+      "legacy_command": "bind-key    -T root           C-b                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} opencode\" \"send-keys M-left\" \"send-keys C-b\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log"
+      ]
+    },
+    {
+      "binding": "root C-f",
+      "legacy_command": "bind-key    -T root           C-f                       if-shell \"[ \\\"$(tmux show -gv @nvimmode)\\\" = \\\"n\\\" ] && /home/lab/.tmux-scroll/pscheck #{pane_pid} fzf atuin proxget view nvim neovim vim diff\" \"send-keys C-f\" \"run-shell \\\"~/.tmux-extrakto/scripts/open.sh #{pane_id}\\\"\"",
+      "existing_test_suite": "guest-remaining-bindings-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/workflow-results.json"
+      ]
+    },
+    {
+      "binding": "root C-h",
+      "legacy_command": "bind-key    -T root           C-h                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} fzf atuin proxget view nvim neovim vim diff\" \"send-keys C-h\" \"select-pane -L\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-j",
+      "legacy_command": "bind-key    -T root           C-j                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} fzf atuin proxget view nvim neovim vim diff\" \"send-keys C-j\" \"select-pane -D\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-k",
+      "legacy_command": "bind-key    -T root           C-k                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} fzf atuin proxget view nvim neovim vim diff\" \"send-keys C-k\" \"select-pane -U\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-l",
+      "legacy_command": "bind-key    -T root           C-l                       if-shell \"/home/lab/.tmux-scroll/pscheck #{pane_pid} fzf atuin proxget view nvim neovim vim diff\" \"send-keys C-l\" \"select-pane -R\"",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-Up",
+      "legacy_command": "bind-key    -T root           C-Up                      resize-pane -U 5",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-Down",
+      "legacy_command": "bind-key    -T root           C-Down                    resize-pane -D 5",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-Left",
+      "legacy_command": "bind-key    -T root           C-Left                    resize-pane -L 10",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "root C-Right",
+      "legacy_command": "bind-key    -T root           C-Right                   resize-pane -R 10",
+      "existing_test_suite": "guest-binding-interactions-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/bindings-results.json"
+      ]
+    },
+    {
+      "binding": "tmcc-user-menu a",
+      "legacy_command": "bind-key    -T tmcc-user-menu a                         display-menu -T \"#[align=centre,fg=default,bg=default] #{host_short} \" -x C -y C \"Python                            \" p \"if-shell -F \\\"#{==:#{session_name},ppt}\\\" {     detach-client  } {       display-popup -b rounded -S \\\"fg=colour001\\\" -E -h 65% -w 65% -T \\\"#[align=centre,fg=color0,bg=color248] Python pad \\\"  \\\"tmux new-session -c \\\\\\\"#{?pane_path,#{pane_path},#{pane_current_path}}\\\\\\\" -A -s ppt bash -c \\\\\\\"tmux set status off; `tmux show-option -gqv \\\"@CONDA_ENV_#S\\\"`python3\\\\\\\"\\\"   }\" \"#{?#{==:#{@CONDA_ENV}#S,},-,}env activate #{@CONDA_ENV}#S\" c \"send-keys \\\" __cd `tmux show-option -gqv \\\"@CONDA_ENV_#S\\\"`../..; source ./env.sh ; __cd -\\\" Enter\" '' \"#{?#{==:#{@CONDA_ENV}#S,},-,}Nvtop\" n \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color002] nvtop \\\" -w 50% -h 50% -E \\\"`tmux show-option -gqv \\\"@CONDA_ENV_#S\\\"`nvtop\\\"\" Htop h \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color002] htop \\\" -w 70% -h 50% -E \\\"htop --sort-key=PERCENT_CPU\\\"\" '' \"Switch client\" t \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color001] switch client to \\\" -w 30% -h 30% -E \\\"tmux list-sessions | sed -E \\\\\\\"s/:.*$//\\\\\\\" | grep -v \\\\\\\"^$(tmux display-message -p #S)\\\\\\\" | grep -v \\\\\\\"ppt\\\\\\\" | grep -v \\\\\\\"scc\\\\\\\" | fzf --reverse --print-query | xargs -I {} sh -c \\\\\\\"tmux has-session -t {} || tmux new-session -d -s {}; tmux switch-client -c #{client_name} -t {}\\\\\\\"\\\"\" \"Switch window\" l \"display-popup -b rounded -T \\\"#[align=centre,fg=color0,bg=color001] switch window to \\\" -w 30% -h 30% -E \\\"tmux list-windows -F \\\\\\\"##{window_index} ##{window_name}\\\\\\\"|  sed \\\\\\\"/^$/d\\\\\\\" |fzf --reverse | cut -d \\\\\\\" \\\\\\\" -f 1 | xargs tmux select-window -t \\\"\" \"Break pane\" _ break-pane \"Join Pane\" j \"choose-window 'join-pane -h -s \\\"%%\\\"'\" \"Rename session\" r \"command-prompt -I '#S' -p '(rename session)' \\\"rename-session '%%'\\\"\" \"Detach client\" d detach-client '' \"Find in pane extrakto/fzf\" f \"run-shell \\\"~/.tmux-extrakto/scripts/open.sh #{pane_id}\\\"\" \"Find path:line in pane\" g \"copy-mode -H ; send-keys -X search-backward  '(^|/|<|[[:space:]\\\"])((.|..)|[[:alnum:]~_\\\"-]*)((/[][[:alnum:]_.#$%&+=@\\\"-]+)+([/ \\\"]|.([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?)|[][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)(:[0-9]+)?)|(/[][[:alnum:]_.#$%&+=@\\\"-]+){2,}([/ \\\"]|.([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?)|[][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)(:[0-9]+)?)?|(.|..)/([][[:alnum:]_.#$%&+=@\\\"-]+(:[0-9]+)?(:[0-9]+)?))'\" \"Back to previous prompt\" b '' \"Open last output in nvim\" B \"new-window -e COLOR= -e PROMPT_PATTERN=\\\\\\\\$~\\\\\\\\s -n last-command-output ~/.tmux-last/plugin.sh\" \"Capture pane\" P \"command-prompt -p 'save history to filename:' -I '/tmp/tmux.history' 'capture-pane -S -; save-buffer %1 ; delete-buffer'\" '' \"Swap Pane Up\" < \"swap-pane -U\" \"Swap Pane Down\" > \"swap-pane -D\" \"#{?pane_marked,Unmark,Mark}\" m \"select-pane -m\" \"#{?pane_marked_set,,-}Swap Marked pane\" s swap-pane \"#{?pane_marked_set,,-}Swap Marked window\" S swap-window '' \"Kill Pane\" k kill-pane \"Kill Window\" K kill-window '' \"Close menu\" q ''",
+      "existing_test_suite": "guest-menu-workflows-test.py",
+      "rex_status": "implemented_and_verified",
+      "acceptance": "Migrated Lua binding is registered and its action family is covered by the cited GUI/Lua checks. No tmux process is used by the Rex backend.",
+      "evidence": [
+        "evidence-rex/workflow-lua-tests.log",
+        "evidence-rex/app-results.json",
+        "evidence-rex/bindings-results.json",
+        "evidence-rex/workflow-results.json"
+      ]
+    }
+  ],
+  "configuration_language": "Lua; Rust exposes terminal, rendering, input, layout, transport and file-transfer primitives.",
+  "verification": "All 73 bindings are checked by scripts/rex-workflow-lua-test.lua. GUI suites exercise the underlying workflows; shared aliases are also checked against their actual Lua registration.",
+  "source_sha256": {
+    "~/dotfiles/tmux.conf": "7289d9cde8332b8f09e151f31f1c248152d91d1c590b76055a117c5b1302e728",
+    "config/tmux/reported-fixes.conf": "40f06da13908c55a4083a37c4728ed983ff05419413c54f53ffed0e0520aa519"
+  },
+  "backend_limits": [
+    "Rex preserves scrollback across GUI detach/reconnect, but not a Rex server restart. Lua save/restore rebuilds layouts and restarts only the configured ssh/tail processes.",
+    "The native command prompt implements the migrated workflow commands; it is not a tmux command-language interpreter."
+  ]
+}

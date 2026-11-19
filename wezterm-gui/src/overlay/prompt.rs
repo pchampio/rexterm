@@ -10,17 +10,25 @@ use termwiz::terminal::Terminal;
 
 struct PromptHost {
     history: BasicHistory,
+    completion: Vec<String>,
 }
 
 impl PromptHost {
-    fn new() -> Self {
+    fn new(completion: Vec<String>) -> Self {
         Self {
             history: BasicHistory::default(),
+            completion,
         }
     }
 }
 
 impl LineEditorHost for PromptHost {
+    fn complete(&self, line: &str, cursor: usize) -> Vec<CompletionCandidate> {
+        let prefix = &line[..cursor];
+        self.completion.iter().filter(|candidate| candidate.starts_with(prefix))
+            .map(|candidate| CompletionCandidate { range: 0..cursor, text: candidate.clone() }).collect()
+    }
+
     fn history(&mut self) -> &mut dyn History {
         &mut self.history
     }
@@ -59,7 +67,7 @@ pub fn show_line_prompt_overlay(
     text.push_str("\r\n");
     term.render(&[Change::Text(text)])?;
 
-    let mut host = PromptHost::new();
+    let mut host = PromptHost::new(args.completion);
     let mut editor = LineEditor::new(&mut term);
     editor.set_prompt(&args.prompt);
     let line =
@@ -74,7 +82,7 @@ pub fn show_line_prompt_overlay(
     Ok(())
 }
 
-fn trampoline(name: String, window: GuiWin, pane: MuxPane, line: Option<String>) {
+pub(crate) fn trampoline(name: String, window: GuiWin, pane: MuxPane, line: Option<String>) {
     promise::spawn::spawn(async move {
         config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane, line))
             .await

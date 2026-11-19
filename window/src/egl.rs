@@ -640,12 +640,6 @@ impl GlState {
             log::trace!("Successfully created a surface using this configuration");
             connection.egl.log_config_info(connection.display, config);
 
-            // Request non-blocking buffer swaps; we'll manage throttling
-            // frames at the application level.
-            unsafe {
-                connection.egl.egl.SwapInterval(connection.display, 0);
-            }
-
             return Ok(Self {
                 connection: Rc::clone(connection),
                 context,
@@ -719,6 +713,12 @@ unsafe impl glium::backend::Backend for GlState {
         {
             let err = self.connection.egl.error("MakeCurrent");
             log::error!("make_current failed {:?} {:?}", self, err);
+        } else {
+            // SwapInterval applies to the current draw surface. Setting it
+            // during creation (before MakeCurrent) fails with BAD_CONTEXT,
+            // leaving blocking swaps enabled on software/X11 drivers.
+            // The window event loop already throttles frames to max_fps.
+            self.connection.SwapInterval(self.connection.display, 0);
         }
     }
 }

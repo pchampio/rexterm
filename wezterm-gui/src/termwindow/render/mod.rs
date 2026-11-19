@@ -36,13 +36,16 @@ use window::color::LinearRgba;
 
 pub mod borders;
 pub mod corners;
+pub mod copyscroll;
 pub mod draw;
 pub mod fancy_tab_bar;
 pub mod paint;
 pub mod pane;
+pub mod popup_frame;
 pub mod screen_line;
 pub mod split;
 pub mod tab_bar;
+pub mod tab_icons;
 pub mod window_buttons;
 
 /// The data that we associate with a line; we use this to cache it shape hash
@@ -90,6 +93,9 @@ pub struct LineToElementParams<'a> {
     pub window_is_transparent: bool,
     pub reverse_video: bool,
     pub shape_key: &'a Option<LineToEleShapeCacheKey>,
+    /// A font other than the terminal's (scaled-down window previews).
+    pub font: Option<&'a Rc<LoadedFont>>,
+    pub render_metrics: &'a RenderMetrics,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -810,6 +816,7 @@ impl crate::TermWindow {
         let key = BorrowedShapeCacheKey {
             style,
             text: &cluster.text,
+            font_id: font.map(|f| f.id()),
         };
         let glyph_info = match self.lookup_cached_shape(&key) {
             Some(Ok(info)) => info,
@@ -980,3 +987,5 @@ fn same_hyperlink(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> boo
         _ => false,
     }
 }
+
+mod pane_status;

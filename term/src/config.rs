@@ -227,6 +227,12 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     fn log_unknown_escape_sequences(&self) -> bool {
         false
     }
+
+    /// OSC 7377 audio: None disables it; an empty command means detect a
+    /// player (see crate::audio).
+    fn audio_player(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 impl_downcast!(TerminalConfiguration);
 

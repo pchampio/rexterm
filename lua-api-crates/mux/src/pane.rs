@@ -97,6 +97,32 @@ impl UserData for MuxPane {
             args.unwrap_or_default().run(this).await
         });
 
+        methods.add_async_method("spawn_popup", |_, this, args: PopupPane| async move {
+            let mux = get_mux()?;
+            let (command, cwd) = args.cmd_builder.to_command_builder();
+            let (_, _, tab_id) = mux.resolve_pane_id(this.0).ok_or_else(|| mlua::Error::external("invoking pane has no tab"))?;
+            let tab = mux.get_tab(tab_id).ok_or_else(|| mlua::Error::external("popup tab disappeared"))?;
+            let root = tab.get_size();
+            let cols = popup_cells(args.width.unwrap_or(0.8), root.cols)?;
+            let rows = popup_cells(args.height.unwrap_or(0.4), root.rows)?;
+            let size = TerminalSize { cols, rows,
+                pixel_width: root.pixel_width * cols / root.cols.max(1),
+                pixel_height: root.pixel_height * rows / root.rows.max(1), dpi: root.dpi };
+            let pane = mux.spawn_popup(this.0, size, command, cwd, args.domain).await
+                .map_err(mlua::Error::external)?;
+            Ok(MuxPane(pane.pane_id()))
+        });
+        methods.add_method("set_popup_visible", |_, this, visible: bool| {
+            let mux = get_mux()?;
+            let (_, _, tab_id) = mux.resolve_pane_id(this.0).ok_or_else(|| mlua::Error::external("popup pane disappeared"))?;
+            mux.get_tab(tab_id).unwrap().set_popup_visible(this.0, visible).map_err(mlua::Error::external)
+        });
+        methods.add_method("is_popup_visible", |_, this, _: ()| {
+            let mux = get_mux()?;
+            Ok(mux.resolve_pane_id(this.0).and_then(|(_, _, tab_id)| mux.get_tab(tab_id))
+                .map(|tab| tab.popup_is_visible(this.0)).unwrap_or(false))
+        });
+
         methods.add_method("send_paste", |_, this, text: String| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
@@ -115,6 +141,22 @@ impl UserData for MuxPane {
             Ok(())
         });
 
+        methods.add_method("rex_context", |lua, this, ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            match pane.downcast_ref::<mux::rex::RexPane>() {
+                Some(rex) => lua.to_value(&rex.context()),
+                None => Ok(mlua::Value::Nil),
+            }
+        });
+        methods.add_async_method("rex_call", |lua, this, (method, args): (String, mlua::Value)| async move {
+            let payload: serde_json::Value = lua.from_value(args)?;
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            let rex = pane.downcast_ref::<mux::rex::RexPane>().ok_or_else(|| mlua::Error::external("pane is not a Rex pane"))?;
+            let result = rex.call(&method, payload).await.map_err(mlua::Error::external)?;
+            lua.to_value(&result)
+        });
         methods.add_method("send_text", |_, this, text: String| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
@@ -273,6 +315,16 @@ impl UserData for MuxPane {
                 Ok(text)
             },
         );
+
+        methods.add_method("get_tmux_transport_pane", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            Ok(mux.get_domain(pane.domain_id()).and_then(|domain| {
+                domain
+                    .downcast_ref::<mux::tmux::TmuxDomain>()
+                    .map(|tmux| MuxPane(tmux.transport_pane_id()))
+            }))
+        });
 
         methods.add_method("get_domain_name", |_, this, _: ()| {
             let mux = get_mux()?;
@@ -494,4 +546,21 @@ impl SplitPane {
 
         Ok(MuxPane(pane.pane_id()))
     }
+}
+
+#[derive(Debug, FromDynamic, ToDynamic)]
+struct PopupPane {
+    #[dynamic(flatten)]
+    cmd_builder: CommandBuilderFrag,
+    #[dynamic(default = "spawn_tab_default_domain")]
+    domain: SpawnTabDomain,
+    width: Option<f32>,
+    height: Option<f32>,
+}
+impl_lua_conversion_dynamic!(PopupPane);
+
+fn popup_cells(value: f32, available: usize) -> mlua::Result<usize> {
+    if !value.is_finite() || value <= 0.0 { return Err(mlua::Error::external("popup size must be positive and finite")); }
+    let cells = if value < 1.0 { (value * available as f32) as usize } else { value as usize };
+    Ok(cells.clamp(1, available.saturating_sub(2).max(1)))
 }

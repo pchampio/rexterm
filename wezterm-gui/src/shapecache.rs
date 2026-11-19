@@ -9,6 +9,8 @@ use wezterm_font::units::*;
 pub struct ShapeCacheKey {
     pub style: TextStyle,
     pub text: String,
+    /// An explicit font (scaled previews, titles), not the style's font.
+    pub font_id: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,6 +64,7 @@ impl ShapedInfo {
 pub struct BorrowedShapeCacheKey<'a> {
     pub style: &'a TextStyle,
     pub text: &'a str,
+    pub font_id: Option<usize>,
 }
 
 impl<'a> BorrowedShapeCacheKey<'a> {
@@ -69,6 +72,7 @@ impl<'a> BorrowedShapeCacheKey<'a> {
         ShapeCacheKey {
             style: self.style.clone(),
             text: self.text.to_owned(),
+            font_id: self.font_id,
         }
     }
 }
@@ -82,6 +86,7 @@ impl ShapeCacheKeyTrait for ShapeCacheKey {
         BorrowedShapeCacheKey {
             style: &self.style,
             text: &self.text,
+            font_id: self.font_id,
         }
     }
 }

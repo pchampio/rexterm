@@ -117,6 +117,13 @@ impl wezterm_term::TerminalConfiguration for TermConfig {
         self.configuration().log_unknown_escape_sequences
     }
 
+    fn audio_player(&self) -> Option<Vec<String>> {
+        let config = self.configuration();
+        config
+            .enable_audio_escape
+            .then(|| config.audio_player.clone())
+    }
+
     fn normalize_output_to_unicode_nfc(&self) -> bool {
         self.configuration().normalize_output_to_unicode_nfc
     }

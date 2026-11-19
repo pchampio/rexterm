@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Make the rexterm bundle from a build of wezterm and wezterm-gui:
+#   OUTPUT/rexterm-linux-x86_64.tar.gz (+ .sha256), top directory wezterm-rex/.
+# Usage: rex/scripts/package [TARGET_DIR] [OUTPUT_DIR]   (default: target/release dist)
+# The bundle has no rex server binary: install it on the host (dotfiles
+# install/github_app rex) and link it as runtime-rex/bin/rex, or put it on PATH.
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+rex=$repo/rex
+target=${1:-$repo/target/release}
+out=${2:-$repo/dist}
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"' EXIT
+bundle=$stage/wezterm-rex
+mkdir -p -- "$bundle/bin" "$bundle/runtime-rex/bin" "$bundle/config/rex/program-icons" "$bundle/scripts"
+cp -P -- "$rex"/bin/* "$bundle/bin/"
+install -m755 -- "$target/wezterm" "$target/wezterm-gui" "$bundle/runtime-rex/bin/"
+cc -O2 -o "$bundle/runtime-rex/bin/rex-extract" "$rex/scripts/rex-extract.c"
+cp -- "$rex/config/wezterm-rex.lua" "$rex/config/wezterm-user.lua" "$bundle/config/"
+cp -- "$rex"/config/rex/*.lua "$rex/config/rex/compatibility.json" "$bundle/config/rex/"
+cp -- "$rex"/config/rex/program-icons/* "$bundle/config/rex/program-icons/"
+cp -- "$rex/scripts/install-rex-companion.py" "$bundle/scripts/"
+cp -- "$rex/README.md" "$bundle/README-REX.md"
+cp -- "$repo/LICENSE.md" "$bundle/WEZTERM-LICENSE.md"
+git -C "$repo" rev-parse HEAD > "$bundle/COMMIT" 2>/dev/null || true
+(
+  cd -- "$bundle"
+  find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
+)
+mkdir -p -- "$out"
+tar -czf "$out/rexterm-linux-x86_64.tar.gz" -C "$stage" wezterm-rex
+(cd -- "$out" && sha256sum rexterm-linux-x86_64.tar.gz > rexterm-linux-x86_64.tar.gz.sha256)
+echo "$out/rexterm-linux-x86_64.tar.gz"

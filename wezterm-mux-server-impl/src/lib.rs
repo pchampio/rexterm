@@ -70,6 +70,13 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         mux.add_domain(&domain);
     }
 
+    for rex_dom in &config.rex_domains {
+        if mux.get_domain_by_name(&rex_dom.name).is_none() {
+            let domain: Arc<dyn Domain> = Arc::new(mux::rex::RexDomain::new(rex_dom.clone()));
+            mux.add_domain(&domain);
+        }
+    }
+
     for exec_dom in &config.exec_domains {
         if mux.get_domain_by_name(&exec_dom.name).is_some() {
             continue;

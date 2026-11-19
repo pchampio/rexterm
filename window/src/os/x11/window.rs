@@ -391,14 +391,18 @@ impl XWindowInner {
                     }
                 }
 
+                let frame_started = std::time::Instant::now();
                 self.events.dispatch(WindowEvent::NeedRepaint);
 
                 self.paint_throttled = true;
                 let window_id = self.window_id;
                 let max_fps = self.config.max_fps;
+                let next_frame = frame_started
+                    + std::time::Duration::from_millis(1000 / max_fps.max(1) as u64);
                 promise::spawn::spawn(async move {
-                    async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64))
-                        .await;
+                    // Include rendering/presentation in the frame budget.
+                    // Sleeping a full interval after a slow frame adds lag.
+                    async_io::Timer::at(next_frame).await;
                     XConnection::with_window_inner(window_id, move |inner| {
                         inner.paint_throttled = false;
                         if inner.invalidated {

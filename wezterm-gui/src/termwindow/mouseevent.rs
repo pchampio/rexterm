@@ -46,13 +46,105 @@ impl super::TermWindow {
             &border,
             top_bar + top + border.top.get() as f32,
         );
-        let rect = self.floating_pane_outer_rect(rect);
+        let rect = if let Some(frame) = pos.pane.popup_frame() {
+            self.popup_frame_outer_rect(&frame, rect)
+        } else {
+            self.floating_pane_outer_rect(rect)
+        };
         (
             rect.origin.x as f64,
             rect.origin.y as f64,
             rect.width() as f64,
             rect.height() as f64,
         )
+    }
+
+    /// Drags a tmux popup (a floating pane with a GUI-drawn frame) by its
+    /// frame. The pane moves locally on every motion; tmux learns the final
+    /// position on release, so dragging has no server round trips.
+    fn popup_frame_mouse_event(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        let mux = Mux::get();
+        if let Some(drag) = self.popup_drag {
+            let Some(tab) = mux.get_tab(drag.tab_id) else {
+                self.popup_drag = None;
+                return false;
+            };
+            let cw = self.render_metrics.cell_size.width as f64;
+            let ch = self.render_metrics.cell_size.height as f64;
+            match &event.kind {
+                WMEK::Move => {
+                    let dx = ((event.coords.x as f64 - drag.start_x) / cw).round() as isize;
+                    let dy = ((event.coords.y as f64 - drag.start_y) / ch).round() as isize;
+                    // Keep the frame (one cell around the pane) in the window.
+                    let cols = self.terminal_size.cols as isize;
+                    let rows = self.terminal_size.rows as isize;
+                    let max_left = (cols - drag.width as isize - 1).max(1);
+                    let max_top = (rows - drag.height as isize - 1).max(1);
+                    let left = (drag.left as isize + dx).clamp(1, max_left) as usize;
+                    let top = (drag.top as isize + dy).clamp(1, max_top) as usize;
+                    tab.drag_floating_pane(drag.pane_id, left, top);
+                    context.set_cursor(Some(CursorIcon::Default));
+                    context.invalidate();
+                }
+                WMEK::Release(MousePress::Left) => {
+                    self.popup_drag = None;
+                    self.current_mouse_buttons.retain(|p| *p != MousePress::Left);
+                    if let Some((left, top, _, _)) = tab.floating_pane_position(drag.pane_id) {
+                        if let Some(domain) = mux
+                            .get_pane(drag.pane_id)
+                            .and_then(|pane| mux.get_domain(pane.domain_id()))
+                        {
+                            if let Some(tmux) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                                tmux.move_floating_pane(drag.pane_id, left, top);
+                            }
+                            if let Some(rex) = domain.downcast_ref::<mux::rex::RexDomain>() {
+                                rex.move_floating_pane(drag.pane_id, left, top);
+                            }
+                        }
+                    }
+                    tab.end_floating_drag();
+                    context.invalidate();
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if !matches!(event.kind, WMEK::Press(MousePress::Left)) {
+            return false;
+        }
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return false;
+        };
+        let point = (event.coords.x as f64, event.coords.y as f64);
+        for pos in self.get_floating_panes_to_render().iter().rev() {
+            let (x, y, w, h) = self.floating_pane_mouse_bounds(pos);
+            if !pointer_in_pane(point, x, y, w, h) {
+                continue;
+            }
+            if pos.pane.popup_frame().is_none() {
+                return false;
+            }
+            let cw = self.render_metrics.cell_size.width as f64;
+            let ch = self.render_metrics.cell_size.height as f64;
+            let inside = pointer_in_pane(point, x + cw, y + ch, w - 2. * cw, h - 2. * ch);
+            if inside {
+                return false;
+            }
+            self.popup_drag = Some(super::PopupDrag {
+                tab_id: tab.tab_id(),
+                pane_id: pos.pane.pane_id(),
+                start_x: point.0,
+                start_y: point.1,
+                left: pos.left,
+                top: pos.top,
+                width: pos.width,
+                height: pos.height,
+            });
+            self.current_mouse_buttons.retain(|p| *p != MousePress::Left);
+            self.current_mouse_buttons.push(MousePress::Left);
+            return true;
+        }
+        false
     }
 
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
@@ -103,6 +195,10 @@ impl super::TermWindow {
 
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
+            // Lua can open a menu for the status text under the pointer.
+            UIItemType::TabBar(TabBarItem::RightStatus) => {
+                self.emit_window_event("right-status-hover", None);
+            }
             UIItemType::TabBar(_) => {}
             UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
@@ -114,6 +210,12 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        if let Some(modal) = self.get_modal() {
+            if modal.window_mouse_event(&event, self) {
+                context.invalidate();
+                return;
+            }
+        }
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -123,6 +225,22 @@ impl super::TermWindow {
         // stored capture is cleared before dispatching that event.
         let mouse_capture = self.current_mouse_capture.clone();
         self.current_mouse_event.replace(event.clone());
+
+        if self.window_overview_mouse(&event, context) {
+            return;
+        }
+        if self.agent_panel_mouse(&event, context) {
+            return;
+        }
+        if self.update_strip_hover(&event) {
+            context.invalidate();
+        }
+        if self.popup_frame_mouse_event(&event, context) {
+            return;
+        }
+        if self.split_drag_mouse_event(&event, context) {
+            return;
+        }
 
         let border = self.get_os_border();
 
@@ -181,6 +299,91 @@ impl super::TermWindow {
         }
 
         self.last_mouse_coords = (x, y);
+
+        // Route the wheel through tmux's real mouse bindings so scrolling up
+        // enters copy mode. The configured bypass modifier still exposes the
+        // native pane's independent scrollback and native selection.
+        // Native selection/search overlays keep the delegate's domain ID,
+        // but their mouse interaction belongs to WezTerm, not tmux.
+        let native_overlay = self.pane_state(pane.pane_id()).overlay.is_some();
+        if let Some(domain) = Mux::get().get_domain(pane.domain_id()).filter(|_| !native_overlay) {
+            if let Some(tmux) = domain.downcast_ref::<mux::tmux::TmuxDomain>() {
+                // A drag that began in tmux keeps going to tmux outside the
+                // window, so it can auto-scroll and always receives its release.
+                let tmux_drag = matches!(event.kind, WMEK::Move | WMEK::Release(_))
+                    && !self.current_mouse_buttons.is_empty();
+                if !event
+                        .modifiers
+                        .contains(self.config.bypass_mouse_reporting_modifiers)
+                    && (tmux_drag
+                        || (x < self.terminal_size.cols as usize
+                            && y < self.terminal_size.rows as i64))
+                {
+                    let mouse = wezterm_term::MouseEvent {
+                        kind: match event.kind {
+                            WMEK::Move => TMEK::Move,
+                            WMEK::Release(_) => TMEK::Release,
+                            _ => TMEK::Press,
+                        },
+                        button: match event.kind {
+                            WMEK::Release(ref p) | WMEK::Press(ref p) => mouse_press_to_tmb(p),
+                            WMEK::Move => {
+                                if event.mouse_buttons.contains(WMB::LEFT)
+                                    || self.current_mouse_buttons.contains(&MousePress::Left)
+                                {
+                                    TMB::Left
+                                } else if event.mouse_buttons.contains(WMB::RIGHT)
+                                    || self.current_mouse_buttons.contains(&MousePress::Right)
+                                {
+                                    TMB::Right
+                                } else if event.mouse_buttons.contains(WMB::MIDDLE)
+                                    || self.current_mouse_buttons.contains(&MousePress::Middle)
+                                {
+                                    TMB::Middle
+                                } else {
+                                    TMB::None
+                                }
+                            }
+                            WMEK::VertWheel(n) if n > 0 => TMB::WheelUp(n as usize),
+                            WMEK::VertWheel(n) => TMB::WheelDown((-n) as usize),
+                            WMEK::HorzWheel(n) if n > 0 => TMB::WheelLeft(n as usize),
+                            WMEK::HorzWheel(n) => TMB::WheelRight((-n) as usize),
+                        },
+                        x,
+                        // Above the window a drag keeps a negative row; the
+                        // tmux domain clamps it onto the drag pane's top row.
+                        y: if tmux_drag {
+                            (event.coords.y as i64 - padding_top as i64 - first_line_offset as i64)
+                                .div_euclid(self.render_metrics.cell_size.height as i64)
+                        } else {
+                            y
+                        },
+                        x_pixel_offset,
+                        y_pixel_offset,
+                        modifiers: event.modifiers,
+                    };
+                    if tmux.send_window_mouse(mouse).unwrap_or(false) {
+                        // Typing hides the OS pointer. This server-owned mouse
+                        // path bypasses mouse_event_terminal, including its
+                        // pointer restoration and stale hyperlink cleanup.
+                        self.clear_terminal_hover(context);
+                        match event.kind {
+                            WMEK::Press(button) => {
+                                self.current_mouse_buttons.retain(|p| *p != button);
+                                self.current_mouse_buttons.push(button);
+                            }
+                            WMEK::Release(button) => {
+                                self.current_mouse_buttons.retain(|p| *p != button);
+                            }
+                            _ => {}
+                        }
+                        self.current_mouse_event = None;
+                        context.invalidate();
+                        return;
+                    }
+                }
+            }
+        }
 
         let mut capture_mouse = false;
 
@@ -549,7 +752,13 @@ impl super::TermWindow {
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
-                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                TabBarItem::RightStatus => {
+                    // The right status holds buttons (the agent button). A
+                    // window drag here would let the window manager grab the
+                    // pointer and swallow the clicks that follow.
+                    self.emit_window_event("right-status-click", None);
+                }
+                TabBarItem::None | TabBarItem::LeftStatus => {
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
@@ -617,6 +826,19 @@ impl super::TermWindow {
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match item {
+                TabBarItem::Tab { tab_idx, .. } => {
+                    let mux=Mux::get();
+                    if let Some(window)=mux.get_window(self.mux_window_id) {
+                        if tab_idx!=window.get_active_tab_idx() {
+                            if let Some(tab)=window.get_tab_at_idx(tab_idx) {
+                                if tab.get_active_pane().and_then(|p|mux.get_domain(p.domain_id())).is_some_and(|d|d.is::<mux::rex::RexDomain>()) {
+                                    self.strip_hover=Some(super::tmux_windows::StripHover{tab_id:tab.tab_id(),x:event.coords.x as f32});
+                                    context.invalidate();
+                                }
+                            }
+                        }
+                    };
+                }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     context.set_window_drag_position(event.screen_coords);
                 }
@@ -631,7 +853,6 @@ impl super::TermWindow {
                     context.set_maximize_button_position(bounds);
                 }
                 TabBarItem::WindowButton(_)
-                | TabBarItem::Tab { .. }
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::VertWheel(n) => {
@@ -766,16 +987,7 @@ impl super::TermWindow {
                 .find(|pos| Some(pos.pane.pane_id()) == target);
             match hovered {
                 Some(pos) => vec![pos],
-                None => {
-                    if !is_already_captured && matches!(&event.kind, WMEK::Press(_)) {
-                        let mux = Mux::get();
-                        if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
-                            mux.set_floating_pane_visibility(tab.tab_id(), false).ok();
-                        }
-                    }
-                    self.clear_terminal_hover(context);
-                    return;
-                }
+                None => self.get_panes_to_render(),
             }
         };
 
@@ -1082,13 +1294,31 @@ impl super::TermWindow {
         };
 
         if allow_action {
+            if let Some(MouseEventTrigger::Up {
+                button: MouseButton::Left,
+                ..
+            }) = event_trigger_type.as_ref()
+            {
+                // Click copy finishes on the release of any drag, including a
+                // fast drag that the click-streak logic reports as a double
+                // click. It never depends on Lua toggle state.
+                if self.is_click_copy_pane(pane.pane_id())
+                    && !self.selection(pane.pane_id()).is_empty()
+                {
+                    self.finish_click_copy(&pane);
+                    context.invalidate();
+                    return;
+                }
+            }
             if let Some(mut event_trigger_type) = event_trigger_type {
                 self.current_event = Some(event_trigger_type.to_dynamic());
                 let mut modifiers = event.modifiers;
 
                 // Since we use shift to force assessing the mouse bindings, pretend
                 // that shift is not one of the mods when the mouse is grabbed.
-                let mut mouse_reporting = pane.is_mouse_grabbed();
+                let mut mouse_reporting = pane.is_mouse_grabbed()
+                    && !(matches!(&event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+                        && pane.wants_native_scroll());
                 if mouse_reporting {
                     if modifiers.contains(self.config.bypass_mouse_reporting_modifiers) {
                         modifiers.remove(self.config.bypass_mouse_reporting_modifiers);

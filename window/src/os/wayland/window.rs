@@ -1415,6 +1415,17 @@ impl WaylandState {
                 if configure.state.contains(SCTKWindowState::MAXIMIZED) {
                     state |= WindowState::MAXIMIZED;
                 }
+                // A tiling compositor (such as COSMIC) sends the tile size
+                // with tiled states. Never replace it with our own initial
+                // cell size (scale change) or trim it to resize increments.
+                if configure.state.intersects(
+                    SCTKWindowState::TILED_LEFT
+                        | SCTKWindowState::TILED_RIGHT
+                        | SCTKWindowState::TILED_TOP
+                        | SCTKWindowState::TILED_BOTTOM,
+                ) {
+                    state |= WindowState::TILED;
+                }
 
                 log::debug!(
                     "Config: self.window_state={:?}, states: {:?} {:?}",

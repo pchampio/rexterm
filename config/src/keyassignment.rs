@@ -465,6 +465,12 @@ pub struct QuickSelectArguments {
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct PromptInputLine {
+    /// Render a command line on the status row with completion above it.
+    #[dynamic(default)]
+    pub bottom: bool,
+    /// Literal completion candidates supplied by Lua.
+    #[dynamic(default)]
+    pub completion: Vec<String>,
     pub action: Box<KeyAssignment>,
     /// Optional label to pre-fill the input line with
     #[dynamic(default)]
@@ -485,6 +491,83 @@ fn default_prompt() -> String {
 pub struct InputSelectorEntry {
     pub label: String,
     pub id: Option<String>,
+}
+
+/// A blank label is a separator; an absent action makes a row disabled.
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct PopupMenuEntry {
+    pub label: String,
+    pub key: Option<String>,
+    #[dynamic(default)]
+    pub mods: Modifiers,
+    pub action: Option<Box<KeyAssignment>>,
+    /// Text shown in a box beside the menu while this row is selected or
+    /// under the pointer (for example the last lines of a terminal).
+    pub preview: Option<String>,
+}
+
+/// One agent shell (a tool command of a coding agent) in the agent panel.
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct AgentPanelEntry {
+    pub block_id: String,
+    #[dynamic(default)]
+    pub agent: String,
+    #[dynamic(default)]
+    pub title: String,
+    /// "running", or "exit CODE" for a finished command.
+    #[dynamic(default)]
+    pub state: String,
+    /// A live terminal of the shell, for its preview.
+    pub pane_id: Option<u64>,
+    /// The program tile of the agent (a name in `tab_bar_icon_dir`).
+    pub icon: Option<String>,
+    /// The Rex block of the agent that ran the command.
+    #[dynamic(default)]
+    pub parent: String,
+}
+
+/// One coding agent session (Claude Code, Codex) of the tab.
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct AgentPanelAgent {
+    #[dynamic(default)]
+    pub name: String,
+    /// "working", "needs_input" or "idle".
+    #[dynamic(default)]
+    pub status: String,
+    #[dynamic(default)]
+    pub title: String,
+    /// What it does now: the tool in use, or its question.
+    #[dynamic(default)]
+    pub detail: String,
+    /// Its Rex block: the commands that it ran name it as their parent.
+    #[dynamic(default)]
+    pub block_id: String,
+    /// Its pane: a click on the agent focuses it.
+    pub pane_id: Option<u64>,
+    pub icon: Option<String>,
+}
+
+/// The agent panel: the agent sessions of the tab, and under each one a card
+/// for each command that it ran, with a live preview of its terminal and
+/// buttons to open it in a popup or stop it.
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct AgentPanel {
+    pub entries: Vec<AgentPanelEntry>,
+    #[dynamic(default)]
+    pub agents: Vec<AgentPanelAgent>,
+    /// A line at the end, for example why commands are missing.
+    #[dynamic(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct PopupMenu {
+    #[dynamic(default)]
+    pub title: String,
+    pub items: Vec<PopupMenuEntry>,
+    /// Where the menu sits: the middle of the window when absent, or
+    /// "BottomRight" (above the right end of a bottom tab bar).
+    pub anchor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
@@ -535,6 +618,17 @@ fn default_message() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct SelectionStyle {
+    pub foreground: crate::color::RgbaColor,
+    pub background: crate::color::RgbaColor,
+    #[dynamic(default)]
+    pub bold: bool,
+    #[dynamic(default)]
+    pub underline: bool,
+    pub duration_milliseconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub enum KeyAssignment {
     SpawnTab(SpawnTabDomain),
     SpawnWindow,
@@ -543,6 +637,7 @@ pub enum KeyAssignment {
     ToggleAlwaysOnBottom,
     SetWindowLevel(WindowLevel),
     CopyTo(ClipboardCopyDestination),
+    SetSelectionStyle(SelectionStyle),
     CopyTextTo {
         text: String,
         destination: ClipboardCopyDestination,
@@ -631,6 +726,9 @@ pub enum KeyAssignment {
         until_unknown: bool,
         #[dynamic(default)]
         prevent_fallback: bool,
+        /// Send unmatched keys directly to the terminal, including the leader.
+        #[dynamic(default)]
+        passthrough: bool,
     },
     PopKeyTable,
     ClearKeyTableStack,
@@ -651,6 +749,8 @@ pub enum KeyAssignment {
     ActivateWindowRelativeNoWrap(isize),
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
+    PopupMenu(PopupMenu),
+    AgentPanel(AgentPanel),
     Confirmation(Confirmation),
     MoveFloatingPaneToHorizontalSplit,
     MoveFloatingPaneToVerticalSplit,
@@ -688,6 +788,20 @@ pub enum RotationDirection {
 
 #[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum CopyModeAssignment {
+    HighlightCommands(bool),
+    CommandSelection(bool),
+    /// Select a shell command (OSC 133 input) and shade the commands on
+    /// screen. `direction`: -1 the command above, 1 the command below, 0 the
+    /// command at the cursor. `prompt_marker` finds the command on a row
+    /// that has no OSC 133 marks: the text after the marker.
+    SelectCommand {
+        direction: isize,
+        prompt_marker: Option<String>,
+    },
+    /// While editing a search: the previous (-1) or next (1) pattern of the
+    /// search history.
+    SearchHistory(isize),
+    MoveToCoordinates { x: usize, y: isize },
     MoveToViewportBottom,
     MoveToViewportTop,
     MoveToViewportMiddle,
@@ -719,6 +833,11 @@ pub enum CopyModeAssignment {
     CycleMatchType,
     ClearPattern,
     EditPattern,
+    SearchForward,
+    SearchBackward,
+    SearchAgain,
+    SearchReverse,
+    ScrollByLine(isize),
     AcceptPattern,
     MoveBackwardSemanticZone,
     MoveForwardSemanticZone,

@@ -244,8 +244,8 @@ impl SelectorState {
             match event {
                 InputEvent::Key(KeyEvent {
                     key: KeyCode::Char(c),
-                    modifiers: Modifiers::NONE,
-                }) if !self.filtering && self.args.alphabet.contains(c) => {
+                    modifiers,
+                }) if !self.filtering && (modifiers.is_empty() || modifiers == Modifiers::SHIFT) && self.args.alphabet.contains(c) => {
                     self.selection.push(c);
                     if let Some(pos) = self.labels.iter().position(|x| *x == self.selection) {
                         // since the number of labels is always <= self.max_items

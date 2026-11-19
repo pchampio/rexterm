@@ -73,6 +73,10 @@ impl UserData for MuxTab {
             Ok(pane)
         });
 
+        methods.add_method("is_zoomed", |_, this, _: ()| {
+            let mux = get_mux()?;
+            Ok(this.resolve(&mux)?.get_zoomed_pane().is_some())
+        });
         methods.add_method("set_zoomed", |_, this, zoomed: bool| {
             let mux = get_mux()?;
             let tab = this.resolve(&mux)?;

@@ -6,6 +6,9 @@ use std::cell::Ref;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 
 pub trait Modal: Downcast {
+    fn window_mouse_event(&self, _event: &window::MouseEvent, _term_window: &mut TermWindow) -> bool {
+        false
+    }
     fn perform_assignment(
         &self,
         _assignment: &KeyAssignment,

@@ -322,7 +322,59 @@ impl std::fmt::Debug for HeapQuadAllocator {
 }
 
 impl HeapQuadAllocator {
-    pub fn apply_to(&self, other: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
+    /// Translate and clip glyph/background geometry, including its texture
+    /// coordinates. Used for pixel scrolling without moving pane/status borders.
+    pub fn apply_y_clipped(&self, other: &mut TripleLayerQuadAllocator, dy: f32, top: f32, bottom: f32) {
+        self.apply_rect_clipped(other, dy, (f32::NEG_INFINITY, top, f32::INFINITY, bottom), false);
+    }
+
+    /// The cursor is a separate, stationary layer. Never retain its pixels in
+    /// scroll snapshots, or paint moving glyphs underneath its current cell.
+    pub fn apply_y_clipped_excluding(&self, other: &mut TripleLayerQuadAllocator,
+        dy: f32, top: f32, bottom: f32, hole: Option<(f32, f32, f32, f32)>) {
+        if let Some((left, y0, right, y1)) = hole {
+            self.apply_y_clipped(other, dy, top, bottom.min(y0));
+            self.apply_y_clipped(other, dy, top.max(y1), bottom);
+            self.apply_rect_clipped(other, dy, (f32::NEG_INFINITY, top.max(y0), left, bottom.min(y1)), false);
+            self.apply_rect_clipped(other, dy, (right, top.max(y0), f32::INFINITY, bottom.min(y1)), false);
+        } else {
+            self.apply_y_clipped(other, dy, top, bottom);
+        }
+    }
+
+    /// Composite a moving screen through a mask expressed in screen pixels.
+    pub fn apply_masked(&self, other: &mut TripleLayerQuadAllocator, dy: f32,
+        rect: (f32, f32, f32, f32), holes: &[(f32, f32, f32, f32)]) {
+        let mut regions = vec![rect];
+        for &(x0, y0, x1, y1) in holes {
+            let mut remaining = Vec::new();
+            for (l, t, r, b) in regions {
+                let (a, c, d, e) = (l.max(x0), t.max(y0), r.min(x1), b.min(y1));
+                if a >= d || c >= e { remaining.push((l,t,r,b)); continue; }
+                if t < c { remaining.push((l,t,r,c)); }
+                if e < b { remaining.push((l,e,r,b)); }
+                if l < a { remaining.push((l,c,a,e)); }
+                if d < r { remaining.push((d,c,r,e)); }
+            }
+            regions = remaining;
+        }
+        for region in regions { self.apply_rect_clipped(other, dy, region, false); }
+    }
+
+    pub fn apply_rect_clipped(&self, other: &mut TripleLayerQuadAllocator,
+        dy: f32, rect: (f32, f32, f32, f32), overlay: bool) {
+        let (left, top, right, bottom) = rect;
+        for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
+            for quad in quads {
+                let mut vertices = quad.to_vertices();
+                if clip_y(&mut vertices, dy, top, bottom) && clip_x(&mut vertices, left, right) {
+                    other.extend_with(if overlay { 2 } else { layer_num }, &vertices);
+                }
+            }
+        }
+    }
+
+    pub fn apply_to(&self, other: &mut dyn TripleLayerQuadAllocatorTrait) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
             for quad in quads {
@@ -400,4 +452,78 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
 fn size() {
     assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
     assert_eq!(std::mem::size_of::<BoxedQuad>(), 84);
+}
+
+fn clip_y(vertices: &mut [Vertex; 4], dy: f32, top: f32, bottom: f32) -> bool {
+    let y0 = vertices[V_TOP_LEFT].position[1] + dy;
+    let y1 = vertices[V_BOT_LEFT].position[1] + dy;
+    let lo = y0.max(top);
+    let hi = y1.min(bottom);
+    if hi <= lo || y1 <= y0 { return false; }
+    let t0 = vertices[V_TOP_LEFT].tex[1];
+    let t1 = vertices[V_BOT_LEFT].tex[1];
+    for index in [V_TOP_LEFT, V_TOP_RIGHT] {
+        vertices[index].position[1] = lo;
+        vertices[index].tex[1] = t0 + (t1-t0) * (lo-y0)/(y1-y0);
+    }
+    for index in [V_BOT_LEFT, V_BOT_RIGHT] {
+        vertices[index].position[1] = hi;
+        vertices[index].tex[1] = t0 + (t1-t0) * (hi-y0)/(y1-y0);
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn scroll_clip_preserves_texture_coordinates() {
+    let mut q = BoxedQuad::default();
+    q.set_position(0., 10., 10., 30.);
+    q.set_texture_discrete(0., 1., 0., 1.);
+    let mut v = q.to_vertices();
+    assert!(clip_y(&mut v, -5., 10., 20.));
+    assert_eq!(v[V_TOP_LEFT].position[1], 10.);
+    assert_eq!(v[V_BOT_LEFT].position[1], 20.);
+    assert_eq!(v[V_TOP_LEFT].tex[1], 0.25);
+    assert_eq!(v[V_BOT_LEFT].tex[1], 0.75);
+    assert!(!clip_y(&mut q.to_vertices(), 100., 0., 50.));
+}
+
+fn clip_x(vertices: &mut [Vertex; 4], left: f32, right: f32) -> bool {
+    let x0 = vertices[V_TOP_LEFT].position[0];
+    let x1 = vertices[V_TOP_RIGHT].position[0];
+    let lo = x0.max(left);
+    let hi = x1.min(right);
+    if hi <= lo || x1 <= x0 { return false; }
+    let t0 = vertices[V_TOP_LEFT].tex[0];
+    let t1 = vertices[V_TOP_RIGHT].tex[0];
+    for index in [V_TOP_LEFT, V_BOT_LEFT] {
+        vertices[index].position[0] = lo;
+        vertices[index].tex[0] = t0 + (t1-t0)*(lo-x0)/(x1-x0);
+    }
+    for index in [V_TOP_RIGHT, V_BOT_RIGHT] {
+        vertices[index].position[0] = hi;
+        vertices[index].tex[0] = t0 + (t1-t0)*(hi-x0)/(x1-x0);
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn scrolling_content_excludes_current_cursor_cell() {
+    let mut source = HeapQuadAllocator::default();
+    let mut quad = source.allocate(0).unwrap();
+    quad.set_position(0., 0., 40., 40.);
+    quad.set_texture_discrete(0., 1., 0., 1.);
+    drop(quad);
+    let mut result = HeapQuadAllocator::default();
+    source.apply_y_clipped_excluding(&mut TripleLayerQuadAllocator::Heap(&mut result),
+        0., 0., 40., Some((10., 10., 20., 30.)));
+    let area: f32 = result.layer0.iter().map(|q| {
+        let (x0,y0,x1,y1) = q.position;
+        assert!(x1 <= 10. || x0 >= 20. || y1 <= 10. || y0 >= 30.);
+        (x1-x0)*(y1-y0)
+    }).sum();
+    assert_eq!(area, 1400.);
+    let left = result.layer0.iter().find(|q| q.position == (0.,10.,10.,30.)).unwrap();
+    assert_eq!(left.tex, (0.,0.25,0.25,0.75));
 }

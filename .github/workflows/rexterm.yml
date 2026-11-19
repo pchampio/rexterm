@@ -1,0 +1,88 @@
+name: rexterm
+
+# Build the WezTerm Rex GUI for Linux x86-64 and publish the bundle
+# (rex/scripts/package). A push to main replaces the "continuous" pre-release;
+# a v* tag makes a release of that name.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rexterm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential curl ca-certificates git \
+            pkg-config cmake python3 libssl-dev libfontconfig1-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-keysyms1-dev libxcb-image0-dev libxcb-util-dev \
+            libxcb-icccm4-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev \
+            libdbus-1-dev libx11-xcb-dev libxcb-ewmh-dev libxcb-randr0-dev libxcb-xkb-dev xorg-dev clang
+
+      - name: Rust 1.99.1
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+
+      - name: Zig 0.17.0 (ghostty-vt)
+        run: |
+          curl -fsSL https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz | tar -xJ -C "$RUNNER_TEMP"
+          echo "ZIG=$RUNNER_TEMP/zig-x86_64-linux-0.17.0/zig" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: rexterm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rexterm-${{ runner.os }}-
+
+      - name: Build
+        run: cargo build --locked --release -p wezterm-gui -p wezterm
+
+      - name: Test (Rex client and terminal model)
+        run: cargo test --locked --release -p wezterm-rex -p wezterm-term
+
+      - name: Package
+        run: rex/scripts/package target/release dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rexterm-linux-x86_64
+          path: dist/*
+
+      - name: Publish the continuous pre-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete continuous --cleanup-tag --yes || true
+          gh release create continuous dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "rexterm continuous" --notes "Build of $GITHUB_SHA."
+
+      - name: Publish the tag release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "rexterm $GITHUB_REF_NAME" --generate-notes

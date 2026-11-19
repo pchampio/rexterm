@@ -413,14 +413,28 @@ impl ConnectionOps for XConnection {
             // be work pending and we don't guarantee that there is a
             // 1:1 wakeup to queued function, so we need to be assertive
             // in order to avoid missing wakeups
-            if SPAWN_QUEUE.run() {
-                // if we processed one, we don't want to sleep because
-                // there may be others to deal with
-                continue;
+            let task_deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(4);
+            let mut work_pending = SPAWN_QUEUE.run();
+            while work_pending && std::time::Instant::now() < task_deadline {
+                work_pending = SPAWN_QUEUE.run();
             }
-
+            // Bound async work so a busy control connection cannot starve
+            // input/repaint. Drain short completion/send chains together:
+            // painting between every tiny task adds a frame to each RPC hop.
             self.dispatch_pending_events()
                 .context("dispatch_pending_events")?;
+            if work_pending {
+                continue;
+            }
+            // Rendering and spawn tasks can make XCB round trips, moving
+            // incoming input off the socket into XCB's local queue. Drain
+            // that queue before sleeping: the fd has no new readiness edge
+            // for those events. Otherwise a click can wait for the next
+            // unrelated input before it is delivered.
+            if self.process_queued_xcb().context("process_xcb_before_sleep")? {
+                continue;
+            }
             if let Err(err) = poll.poll(&mut events, None) {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
@@ -497,31 +511,23 @@ impl XConnection {
         }
     }
 
-    fn process_queued_xcb(&self) -> anyhow::Result<()> {
-        if let Some(event) = self
-            .conn
-            .poll_for_event()
-            .context("X11 connection is broken")?
-        {
-            if let Err(err) = self.process_xcb_event_ime(&event) {
-                return Err(err);
-            }
-        }
-        self.conn.flush().context("flushing pending requests")?;
-
+    fn process_queued_xcb(&self) -> anyhow::Result<bool> {
+        let mut processed = false;
         loop {
             match self
                 .conn
-                .poll_for_queued_event()
-                .context("poll_for_queued_event")?
+                .poll_for_event()
+                .context("X11 connection is broken")?
             {
                 None => {
                     self.conn.flush().context("flushing pending requests")?;
-                    return Ok(());
+                    return Ok(processed);
                 }
-                Some(event) => self
-                    .process_xcb_event_ime(&event)
-                    .context("process_xcb_event_ime")?,
+                Some(event) => {
+                    processed = true;
+                    self.process_xcb_event_ime(&event)
+                        .context("process_xcb_event_ime")?;
+                }
             }
             self.conn.flush().context("flushing pending requests")?;
         }

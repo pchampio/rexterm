@@ -88,6 +88,14 @@ impl crate::TermWindow {
         border: &Border,
         top_pixel_y: f32,
     ) -> euclid::Rect<f32, window::PixelUnit> {
+        if pos.pane.has_server_frame() {
+            return euclid::rect(
+                padding_left + pos.left as f32 * self.render_metrics.cell_size.width as f32,
+                top_pixel_y + pos.top as f32 * self.render_metrics.cell_size.height as f32,
+                pos.width as f32 * self.render_metrics.cell_size.width as f32,
+                pos.height as f32 * self.render_metrics.cell_size.height as f32,
+            );
+        }
         let mut base_rect =
             self.compute_background_rect(pos, padding_left, padding_top, border, top_pixel_y);
         if pos.is_floating {
@@ -172,6 +180,12 @@ impl crate::TermWindow {
         pos: PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
+        if let Some(frame) = pos.pane.popup_frame() {
+            return self.paint_popup_frame(&pos, &frame, layers);
+        }
+        if pos.pane.has_server_frame() {
+            return Ok(());
+        }
         let (padding_left, padding_top) = self.padding_left_top();
         let config = self.config.floating_pane_border.clone();
         let floating_pane_border = self.get_floating_pane_border();

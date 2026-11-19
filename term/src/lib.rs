@@ -23,6 +23,8 @@ use std::str;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_surface::SequenceNo;
 
+pub mod audio;
+pub mod commands;
 pub mod config;
 pub use config::TerminalConfiguration;
 

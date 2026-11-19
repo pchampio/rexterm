@@ -40,6 +40,9 @@ impl Recency {
 struct TabInner {
     id: TabId,
     pane: Option<Tree>,
+    remote_layout: Option<Vec<RemotePaneGeometry>>,
+    remote_frames: HashMap<PaneId, PositionedPane>,
+    remote_chrome: Option<PositionedPane>,
     size: TerminalSize,
     size_before_zoom: TerminalSize,
     active: usize,
@@ -48,6 +51,9 @@ struct TabInner {
     floating_panes: Vec<Arc<dyn Pane>>,
     floating_pane_sizes: HashMap<PaneId, (usize, usize)>,
     floating_pane_positions: HashMap<PaneId, (usize, usize)>,
+    /// A floating pane the GUI is dragging: remote updates keep its position.
+    floating_drag: Option<PaneId>,
+    local_popups: HashMap<PaneId, bool>,
     active_floating_pane: usize,
     floating_pane_visible: bool,
     recency: Recency,
@@ -83,6 +89,97 @@ pub struct PositionedPane {
     pub pixel_height: usize,
     /// The pane instance
     pub pane: Arc<dyn Pane>,
+}
+
+/// Geometry supplied by a remote multiplexer; the server owns the layout.
+#[derive(Clone)]
+pub(crate) struct RemotePaneGeometry {
+    pub pane: Arc<dyn Pane>,
+    pub left: usize,
+    pub top: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub floating: bool,
+    pub active: bool,
+}
+
+fn remote_pane_tree(
+    panes: &[RemotePaneGeometry],
+    left: usize,
+    top: usize,
+    size: TerminalSize,
+) -> anyhow::Result<Tree> {
+    if panes.len() == 1 {
+        return Ok(Tree::Leaf(panes[0].pane.clone()));
+    }
+    for horizontal in [true, false] {
+        let mut cuts: Vec<_> = panes
+            .iter()
+            .map(|p| if horizontal { p.left } else { p.top })
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        for cut in cuts {
+            let origin = if horizontal { left } else { top };
+            let extent = if horizontal { size.cols } else { size.rows };
+            if cut <= origin + 1 || cut >= origin + extent {
+                continue;
+            }
+            let (a, b): (Vec<_>, Vec<_>) = panes.iter().cloned().partition(|p| {
+                if horizontal {
+                    p.left < cut
+                } else {
+                    p.top < cut
+                }
+            });
+            if a.is_empty()
+                || b.is_empty()
+                || a.iter().any(|p| {
+                    if horizontal {
+                        p.left + p.cols >= cut
+                    } else {
+                        p.top + p.rows > cut
+                    }
+                })
+            {
+                continue;
+            }
+            let mut first = size;
+            let mut second = size;
+            if horizontal {
+                first.cols = cut - left - 1;
+                second.cols = left + size.cols - cut;
+            } else {
+                first.rows = cut - top - 1;
+                second.rows = top + size.rows - cut;
+            }
+            let cell_width = size.pixel_width / size.cols.max(1);
+            let cell_height = size.pixel_height / size.rows.max(1);
+            first.pixel_width = first.cols * cell_width;
+            first.pixel_height = first.rows * cell_height;
+            second.pixel_width = second.cols * cell_width;
+            second.pixel_height = second.rows * cell_height;
+            return Ok(Tree::Node {
+                left: Box::new(remote_pane_tree(&a, left, top, first)?),
+                right: Box::new(remote_pane_tree(
+                    &b,
+                    if horizontal { cut } else { left },
+                    if horizontal { top } else { cut },
+                    second,
+                )?),
+                data: Some(SplitDirectionAndSize {
+                    direction: if horizontal {
+                        SplitDirection::Horizontal
+                    } else {
+                        SplitDirection::Vertical
+                    },
+                    first,
+                    second,
+                }),
+            });
+        }
+    }
+    anyhow::bail!("remote pane rectangles do not form a tiled layout")
 }
 
 impl std::fmt::Debug for PositionedPane {
@@ -608,7 +705,69 @@ impl Tab {
             }
         }
         panes.sort_by_key(|pane| pane.is_active);
-        panes
+        let mut framed = Vec::new();
+        for pane in panes {
+            if let Some(frame) = inner.remote_frames.get(&pane.pane.pane_id()) {
+                let mut frame = frame.clone();
+                frame.index = pane.index;
+                framed.push(frame);
+            }
+            framed.push(pane);
+        }
+        framed
+    }
+
+    pub fn set_remote_chrome(&self, pane: PositionedPane) {
+        self.inner.lock().remote_chrome = Some(pane);
+    }
+
+    pub fn get_remote_chrome(&self) -> Option<PositionedPane> {
+        let inner = self.inner.lock();
+        // The server capture already reflects zoom; its full-width strip
+        // remains above the enlarged native pane just as it does above splits.
+        inner.remote_chrome.clone()
+    }
+
+    pub fn set_remote_frame(&self, parent: PaneId, frame: PositionedPane) {
+        self.inner.lock().remote_frames.insert(parent, frame);
+    }
+
+    pub fn remove_remote_frame(&self, parent: PaneId) {
+        self.inner.lock().remote_frames.remove(&parent);
+    }
+
+    pub fn add_popup_pane(&self, size: TerminalSize, pane: Arc<dyn Pane>) {
+        let mut inner = self.inner.lock();
+        let id = pane.pane_id();
+        for visible in inner.local_popups.values_mut() { *visible = false; }
+        inner.local_popups.insert(id, true);
+        inner.floating_pane_sizes.insert(id, (size.cols, size.rows));
+        let root = inner.size;
+        inner.floating_pane_positions.insert(id, (root.cols.saturating_sub(size.cols)/2, root.rows.saturating_sub(size.rows)/2));
+        inner.append_floating_pane(pane);
+    }
+
+    pub fn popup_is_visible(&self, pane_id: PaneId) -> bool {
+        self.inner.lock().local_popups.get(&pane_id).copied().unwrap_or(false)
+    }
+
+    pub fn set_popup_visible(&self, pane_id: PaneId, visible: bool) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        anyhow::ensure!(inner.local_popups.contains_key(&pane_id), "pane is not a popup");
+        let index = inner.floating_panes.iter().position(|p| p.pane_id() == pane_id)
+            .ok_or_else(|| anyhow::anyhow!("popup pane no longer exists"))?;
+        let prior = inner.get_active_pane();
+        if visible {
+            for value in inner.local_popups.values_mut() { *value = false; }
+            inner.active_floating_pane = index;
+            inner.floating_pane_visible = true;
+        } else if inner.active_floating_pane == index {
+            inner.floating_pane_visible = false;
+        }
+        inner.local_popups.insert(pane_id, visible);
+        inner.advise_focus_change(prior);
+        Mux::get().notify(MuxNotification::TabResized(inner.id));
+        Ok(())
     }
 
     pub fn get_active_floating_pane(&self) -> Option<PositionedPane> {
@@ -679,13 +838,129 @@ impl Tab {
     /// The adjusted size is propagated downwards to contained children and
     /// their panes are resized accordingly.
     pub fn resize_split_by(&self, split_index: usize, delta: isize) {
-        self.inner.lock().resize_split_by(split_index, delta)
+        self.inner.lock().resize_split_by(split_index, delta);
+        self.persist_rex_layout();
+    }
+
+    fn persist_rex_layout(&self) {
+        let Some(pane)=self.get_active_pane()else{return};
+        let Some(mux)=Mux::try_get()else{return};let Some(domain)=mux.get_domain(pane.domain_id())else{return};
+        if let Some(rex)=domain.downcast_ref::<crate::rex::RexDomain>() {rex.persist_layout(self.tab_id());}
+    }
+
+    /// Moves a tmux separator in this tab's remote layout while the GUI drags
+    /// it (tmux gets the final size on release, then resyncs the layout).
+    /// `vertical`: a separator column `from`, else the border row `from` of
+    /// the panes above it. `at` is the pointer's row (or column) along it:
+    /// every pane on the same continuous separator moves. Returns false when
+    /// a pane would get narrower than two cells.
+    pub fn drag_remote_separator(&self, vertical: bool, from: usize, to: usize, at: usize) -> bool {
+        let mut inner = self.inner.lock();
+        let Some(layout) = inner.remote_layout.as_mut() else {
+            return false;
+        };
+        let delta = to as isize - from as isize;
+        if delta == 0 {
+            return true;
+        }
+        // (before: ends at the separator, after: starts right after it,
+        //  span start, span end) for each tiled pane, along the separator.
+        let side = |p: &RemotePaneGeometry| -> Option<(bool, usize, usize)> {
+            if p.floating {
+                return None;
+            }
+            if vertical {
+                if p.left + p.cols == from {
+                    Some((true, p.top, p.top + p.rows))
+                } else if p.left == from + 1 {
+                    Some((false, p.top, p.top + p.rows))
+                } else {
+                    None
+                }
+            } else if p.top + p.rows == from + 1 {
+                Some((true, p.left, p.left + p.cols))
+            } else if p.top == from + 1 {
+                Some((false, p.left, p.left + p.cols))
+            } else {
+                None
+            }
+        };
+        let mut chosen = vec![false; layout.len()];
+        let (mut lo, mut hi) = (at, at + 1);
+        loop {
+            let mut grew = false;
+            for (i, p) in layout.iter().enumerate() {
+                if let Some((_, a, b)) = side(p) {
+                    if !chosen[i] && a < hi && b > lo {
+                        chosen[i] = true;
+                        lo = lo.min(a);
+                        hi = hi.max(b);
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let fits = layout.iter().enumerate().all(|(i, p)| {
+            if !chosen[i] {
+                return true;
+            }
+            let (before, _, _) = side(p).unwrap();
+            let size = if vertical { p.cols } else { p.rows } as isize;
+            let border = if vertical { 0 } else { 1 };
+            let new = if before { size + delta } else { size - delta };
+            new >= 2 + border
+        });
+        if !fits || !chosen.iter().any(|c| *c) {
+            return false;
+        }
+        let mut resized = vec![];
+        for (i, p) in layout.iter_mut().enumerate() {
+            if !chosen[i] {
+                continue;
+            }
+            let (before, _, _) = side(p).unwrap();
+            match (vertical, before) {
+                (true, true) => p.cols = (p.cols as isize + delta) as usize,
+                (true, false) => {
+                    p.left = (p.left as isize + delta) as usize;
+                    p.cols = (p.cols as isize - delta) as usize;
+                }
+                (false, true) => p.rows = (p.rows as isize + delta) as usize,
+                (false, false) => {
+                    p.top = (p.top as isize + delta) as usize;
+                    p.rows = (p.rows as isize - delta) as usize;
+                }
+            }
+            resized.push((p.pane.clone(), p.cols, p.rows));
+        }
+        let size = inner.size;
+        drop(inner);
+        // The local terminals reflow from their own history at once; tmux
+        // gets the final size on release and the panes are synced after.
+        let cell_width = size.pixel_width / size.cols.max(1);
+        let cell_height = size.pixel_height / size.rows.max(1);
+        for (pane, cols, rows) in resized {
+            if let Some(local) = pane.downcast_ref::<crate::localpane::LocalPane>() {
+                local.resize_terminal_only(TerminalSize {
+                    cols,
+                    rows,
+                    pixel_width: cols * cell_width,
+                    pixel_height: rows * cell_height,
+                    dpi: size.dpi,
+                });
+            }
+        }
+        true
     }
 
     /// Adjusts the size of the active pane in the specified direction
     /// by the specified amount.
     pub fn adjust_pane_size(&self, direction: PaneDirection, amount: usize) {
-        self.inner.lock().adjust_pane_size(direction, amount)
+        self.inner.lock().adjust_pane_size(direction, amount);
+        self.persist_rex_layout();
     }
 
     pub fn adjust_floating_pane_size(
@@ -795,6 +1070,131 @@ impl Tab {
         self.inner.lock().set_active_floating_pane(index, true);
     }
 
+    /// Apply server-owned floating geometry without emitting a user resize.
+    /// Rex provides split proportions; the GUI computes cells and resizes each PTY.
+    /// Unlike tmux, Rex has no terminal-sized client canvas to resize.
+    pub(crate) fn sync_rex_layout(&self, panes: &[RemotePaneGeometry], zoomed: bool) -> anyhow::Result<()> {
+        self.sync_remote_layout(panes, zoomed)?;
+        let mut inner = self.inner.lock();
+        inner.remote_layout = None;
+        let local_ids=inner.local_popups.keys().copied().collect::<std::collections::HashSet<_>>();
+        inner.floating_panes.retain(|p| local_ids.contains(&p.pane_id()) || panes.iter().any(|g| g.floating && g.pane.pane_id()==p.pane_id()));
+        if inner.floating_panes.is_empty() { inner.floating_pane_visible = false; }
+        let size=inner.size;
+        inner.resize(size);
+        Ok(())
+    }
+
+    pub(crate) fn sync_remote_layout(
+        &self,
+        panes: &[RemotePaneGeometry],
+        zoomed: bool,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        let prior = inner.get_active_pane();
+        let popup = prior.as_ref().filter(|p| inner.local_popups.get(&p.pane_id()) == Some(&true))
+            .map(|p| p.pane_id());
+        let tiled: Vec<_> = panes.iter().filter(|p| !p.floating).cloned().collect();
+        if !tiled.is_empty() && !zoomed {
+            let mut size = inner.size;
+            size.cols = tiled.iter().map(|p| p.left + p.cols).max().unwrap();
+            size.rows = tiled.iter().map(|p| p.top + p.rows).max().unwrap();
+            let tree = remote_pane_tree(&tiled, 0, 0, size)?;
+            inner.pane = Some(tree);
+            // The GUI retains its physical window size; remote cell geometry
+            // drives split proportions without destroying panes or history.
+        }
+        for p in panes {
+            if p.floating {
+                if !inner
+                    .floating_panes
+                    .iter()
+                    .any(|f| f.pane_id() == p.pane.pane_id())
+                {
+                    inner.floating_panes.push(p.pane.clone());
+                }
+                inner
+                    .floating_pane_sizes
+                    .insert(p.pane.pane_id(), (p.cols, p.rows));
+                if inner.floating_drag != Some(p.pane.pane_id()) {
+                    inner.floating_pane_positions.insert(p.pane.pane_id(), (p.left, p.top));
+                }
+                inner.floating_pane_visible = true;
+            }
+        }
+        inner.remote_layout = Some(panes.to_vec());
+        if let Some(active) = panes.iter().find(|p| p.active) {
+            if active.floating {
+                if let Some(index) = inner
+                    .floating_panes
+                    .iter()
+                    .position(|p| p.pane_id() == active.pane.pane_id())
+                {
+                    inner.active_floating_pane = index;
+                    inner.floating_pane_visible = true;
+                }
+            } else {
+                inner.active = tiled
+                    .iter()
+                    .position(|p| p.pane.pane_id() == active.pane.pane_id())
+                    .unwrap_or(0);
+                inner.floating_pane_visible = false;
+            }
+        }
+        // Do not feed server zoom back through local resize operations.
+        inner.zoomed = if zoomed {
+            panes.iter().find(|p| p.active).map(|p| p.pane.clone())
+        } else {
+            None
+        };
+        // Native popups are not server panes. A background tmux layout poll
+        // must not hide them or steal their keyboard focus.
+        if let Some(id) = popup {
+            if let Some(index) = inner.floating_panes.iter().position(|p| p.pane_id() == id) {
+                inner.active_floating_pane = index;
+                inner.floating_pane_visible = true;
+            }
+        }
+        inner.advise_focus_change(prior);
+        Ok(())
+    }
+
+    pub fn set_remote_floating_geometry(
+        &self,
+        pane_id: PaneId,
+        left: usize,
+        top: usize,
+        cols: usize,
+        rows: usize,
+    ) {
+        let mut inner = self.inner.lock();
+        inner
+            .floating_pane_sizes
+            .insert(pane_id, (cols.max(1), rows.max(1)));
+        if inner.floating_drag != Some(pane_id) {
+            inner.floating_pane_positions.insert(pane_id, (left, top));
+        }
+    }
+
+    /// Moves a floating pane at once while the GUI drags it. Until
+    /// `end_floating_drag`, server geometry updates keep this position.
+    pub fn drag_floating_pane(&self, pane_id: PaneId, left: usize, top: usize) {
+        let mut inner = self.inner.lock();
+        inner.floating_drag = Some(pane_id);
+        inner.floating_pane_positions.insert(pane_id, (left, top));
+    }
+
+    pub fn end_floating_drag(&self) {
+        self.inner.lock().floating_drag = None;
+    }
+
+    pub fn floating_pane_position(&self, pane_id: PaneId) -> Option<(usize, usize, usize, usize)> {
+        let inner = self.inner.lock();
+        let (left, top) = inner.floating_pane_positions.get(&pane_id).copied()?;
+        let (cols, rows) = inner.floating_pane_sizes.get(&pane_id).copied()?;
+        Some((left, top, cols, rows))
+    }
+
     pub fn append_floating_pane(&self, pane: Arc<dyn Pane>) {
         self.inner.lock().append_floating_pane(pane);
     }
@@ -879,6 +1279,9 @@ impl TabInner {
         Self {
             id: TAB_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
             pane: Some(Tree::new()),
+            remote_layout: None,
+            remote_frames: HashMap::new(),
+            remote_chrome: None,
             size: *size,
             size_before_zoom: *size,
             active: 0,
@@ -888,6 +1291,8 @@ impl TabInner {
             floating_panes: vec![],
             floating_pane_sizes: HashMap::new(),
             floating_pane_positions: HashMap::new(),
+            floating_drag: None,
+            local_popups: HashMap::new(),
             active_floating_pane: 0,
             floating_pane_visible: false,
         }
@@ -1167,6 +1572,12 @@ impl TabInner {
     }
 
     fn floating_pane_is_visible(&self) -> bool {
+
+        if self.local_popups.values().any(|visible| *visible) { return true; }
+        if self.floating_panes.iter().any(|p|p.is::<crate::rex::RexPane>()) {return self.zoomed.is_none();}
+        if self.remote_layout.is_some() {
+            return !self.floating_panes.is_empty() && self.zoomed.is_none();
+        }
         self.floating_pane_visible && !self.zoomed.is_some()
     }
 
@@ -1179,14 +1590,39 @@ impl TabInner {
             return None;
         }
         let floating_pane = self.floating_panes.get(index)?;
+        if self.local_popups.get(&floating_pane.pane_id()) == Some(&false) { return None; }
+        if self.zoomed.is_some() && !self.local_popups.contains_key(&floating_pane.pane_id()) { return None; }
         let root_size = self.size;
+        if floating_pane.has_server_frame() {
+            let (cols, rows) = self
+                .floating_pane_sizes
+                .get(&floating_pane.pane_id())
+                .copied()?;
+            let (left, top) = self
+                .floating_pane_positions
+                .get(&floating_pane.pane_id())
+                .copied()?;
+            return Some(PositionedPane {
+                index,
+                is_active: index == self.active_floating_pane && self.floating_pane_visible,
+                is_zoomed: false,
+                is_floating: true,
+                left,
+                top,
+                width: cols,
+                height: rows,
+                pixel_width: cols * root_size.pixel_width / root_size.cols.max(1),
+                pixel_height: rows * root_size.pixel_height / root_size.rows.max(1),
+                pane: floating_pane.clone(),
+            });
+        }
         let dimensions = floating_pane.get_dimensions();
         let size =
             Self::floating_size_in_cells(root_size, dimensions.cols, dimensions.viewport_rows);
         let (left, top) = self.floating_pane_position(floating_pane.pane_id(), root_size, size);
         Some(PositionedPane {
             index,
-            is_active: index == self.active_floating_pane,
+            is_active: index == self.active_floating_pane && self.floating_pane_visible,
             is_zoomed: false,
             is_floating: true,
             left,
@@ -1212,6 +1648,8 @@ impl TabInner {
             .map(|pos| pos.pane)
             .collect();
         panes.extend(self.floating_panes.iter().cloned());
+        panes.extend(self.remote_frames.values().map(|p| p.pane.clone()));
+        panes.extend(self.remote_chrome.iter().map(|p| p.pane.clone()));
         panes
     }
 
@@ -1280,6 +1718,31 @@ impl TabInner {
 
     fn iter_panes_impl(&mut self, respect_zoom_state: bool) -> Vec<PositionedPane> {
         let mut panes = vec![];
+        if let Some(remote) = &self.remote_layout {
+            let cw = self.size.pixel_width / self.size.cols.max(1);
+            let ch = self.size.pixel_height / self.size.rows.max(1);
+            return remote
+                .iter()
+                .filter(|p| !p.floating)
+                .enumerate()
+                .filter(|(index, _)| {
+                    !respect_zoom_state || self.zoomed.is_none() || *index == self.active
+                })
+                .map(|(index, p)| PositionedPane {
+                    index,
+                    is_active: index == self.active && !self.is_floating_pane_active(),
+                    is_zoomed: self.zoomed.is_some(),
+                    is_floating: false,
+                    left: p.left,
+                    top: p.top,
+                    width: p.cols,
+                    height: p.rows,
+                    pixel_width: p.cols * cw,
+                    pixel_height: p.rows * ch,
+                    pane: p.pane.clone(),
+                })
+                .collect();
+        }
 
         if respect_zoom_state {
             if let Some(zoomed) = self.zoomed.as_ref() {
@@ -1409,6 +1872,10 @@ impl TabInner {
             }
         }
 
+        if self.remote_layout.is_some() {
+            // Horizontal separator cells belong to tmux's pane status rows.
+            dividers.retain(|s| s.direction == SplitDirection::Horizontal);
+        }
         dividers
     }
 
@@ -1422,6 +1889,41 @@ impl TabInner {
             return;
         }
 
+        // Local popups also exist in server-owned tabs. Resize and recenter
+        // them before that branch returns; tmux cannot resize local jobs.
+        let popups: Vec<_> = self.floating_panes.iter().filter(|p| self.local_popups.contains_key(&p.pane_id())).cloned().collect();
+        for pane in popups {
+            let popup_size = self.floating_pane_size(pane.pane_id(), size);
+            self.floating_pane_positions.insert(pane.pane_id(),
+                (size.cols.saturating_sub(popup_size.cols)/2, size.rows.saturating_sub(popup_size.rows)/2));
+            pane.resize(popup_size).ok();
+        }
+        if let Some(remote) = &self.remote_layout {
+            self.size = size;
+            if let Some(p) = remote.first() {
+                crate::tmux_keys::resize_client(
+                    p.pane.domain_id(),
+                    size.cols,
+                    size.rows,
+                    size.pixel_width / size.cols.max(1),
+                    size.pixel_height / size.rows.max(1),
+                );
+            }
+            let cw = size.pixel_width / size.cols.max(1);
+            let ch = size.pixel_height / size.rows.max(1);
+            for p in remote {
+                p.pane
+                    .resize(TerminalSize {
+                        cols: p.cols,
+                        rows: p.rows,
+                        pixel_width: p.cols * cw,
+                        pixel_height: p.rows * ch,
+                        dpi: size.dpi,
+                    })
+                    .ok();
+            }
+            return;
+        }
         for floating_pane in &self.floating_panes {
             floating_pane
                 .resize(self.floating_pane_size(floating_pane.pane_id(), size))
@@ -2005,10 +2507,13 @@ impl TabInner {
 
     fn remove_pane(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
         let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id, false);
-        for pane in panes {
-            return Some(pane);
-        }
-        None
+        // Remote enumeration uses this geometry snapshot, not the local tree.
+        // A move must detach both references before retiring its source tab.
+        let remote = self.remote_layout.as_mut().and_then(|layout| {
+            let index = layout.iter().position(|p| p.pane.pane_id() == pane_id)?;
+            Some(layout.remove(index).pane)
+        });
+        panes.into_iter().next().or(remote)
     }
 
     fn remove_pane_if<F>(&mut self, f: F, kill: bool) -> Vec<Arc<dyn Pane>>
@@ -2189,10 +2694,20 @@ impl TabInner {
     }
 
     fn is_floating_pane_active(&self) -> bool {
+        if self.active_popup().is_some() { return true; }
+        if self.floating_panes.get(self.active_floating_pane)
+            .map(|p| self.local_popups.contains_key(&p.pane_id())).unwrap_or(false) { return false; }
         self.zoomed.is_none() && !self.floating_panes.is_empty() && self.floating_pane_visible
     }
 
+    fn active_popup(&self) -> Option<Arc<dyn Pane>> {
+        let pane = self.floating_panes.get(self.active_floating_pane)?;
+        (self.floating_pane_visible && self.local_popups.get(&pane.pane_id()) == Some(&true))
+            .then(|| pane.clone())
+    }
+
     fn get_active_pane(&mut self) -> Option<Arc<dyn Pane>> {
+        if let Some(popup) = self.active_popup() { return Some(popup); }
         if let Some(zoomed) = self.zoomed.as_ref() {
             return Some(Arc::clone(zoomed));
         }
@@ -2273,8 +2788,9 @@ impl TabInner {
     }
 
     fn set_active_floating_pane(&mut self, index: usize, invalidate: bool) {
-        if index != self.active_floating_pane && index < self.floating_panes.len() {
+        if (index != self.active_floating_pane || !self.floating_pane_visible) && index < self.floating_panes.len() {
             let prior = self.get_active_pane();
+            self.floating_pane_visible = true;
             self.active_floating_pane = index;
             let mux = Mux::get();
             mux.notify(MuxNotification::ActiveFloatingPaneChanged {
@@ -2314,6 +2830,11 @@ impl TabInner {
 
     fn set_active_idx(&mut self, pane_index: usize) {
         let prior = self.get_active_pane();
+        // Local popup visibility is stored independently from keyboard focus.
+        // Clicking the body leaves it painted and available to click again.
+        if !self.local_popups.is_empty() || self.floating_panes.iter().any(|p| p.is::<crate::rex::RexPane>()) {
+            self.floating_pane_visible = false;
+        }
         self.active = pane_index;
         self.recency.tag(pane_index);
         self.advise_focus_change(prior);
@@ -2393,6 +2914,7 @@ impl TabInner {
         let result = self.floating_panes.remove(index);
         self.floating_pane_sizes.remove(&result.pane_id());
         self.floating_pane_positions.remove(&result.pane_id());
+        self.local_popups.remove(&result.pane_id());
         if self
             .zoomed
             .as_ref()
@@ -3988,6 +4510,211 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    #[test]
+    fn tmux_rectangles_keep_shared_status_rows_and_focus() {
+        Mux::set_mux(&Arc::new(Mux::new(None)));
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let a = FakePane::new(801, size);
+        let b = FakePane::new(802, size);
+        let c = FakePane::new(803, size);
+        tab.assign_pane(&a);
+        let geometry = vec![
+            RemotePaneGeometry {
+                pane: a.clone(),
+                left: 0,
+                top: 0,
+                cols: 39,
+                rows: 12,
+                floating: false,
+                active: true,
+            },
+            RemotePaneGeometry {
+                pane: b.clone(),
+                left: 0,
+                top: 12,
+                cols: 39,
+                rows: 12,
+                floating: false,
+                active: false,
+            },
+            RemotePaneGeometry {
+                pane: c.clone(),
+                left: 40,
+                top: 0,
+                cols: 40,
+                rows: 24,
+                floating: false,
+                active: false,
+            },
+        ];
+        tab.sync_remote_layout(&geometry, false).unwrap();
+        let positions = tab.iter_panes();
+        assert_eq!(
+            positions
+                .iter()
+                .map(|p| (p.left, p.top, p.width, p.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 39, 12), (0, 12, 39, 12), (40, 0, 40, 24)]
+        );
+        // A local mouse focus must be rendered immediately; otherwise a render
+        // notification sends the previous pane back to the server.
+        tab.set_active_pane(&c);
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 803);
+        assert_eq!(
+            tab.iter_panes()
+                .iter()
+                .filter(|p| p.is_active)
+                .map(|p| p.pane.pane_id())
+                .collect::<Vec<_>>(),
+            vec![803]
+        );
+    }
+
+    #[test]
+    fn remote_pane_move_survives_source_tab_retirement() {
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let size = TerminalSize { rows: 24, cols: 80, pixel_width: 800, pixel_height: 480, dpi: 96 };
+        for zoomed in [false, true] {
+            let source = Arc::new(Tab::new(&size));
+            let destination = Arc::new(Tab::new(&size));
+            let pane = FakePane::new(if zoomed { 861 } else { 860 }, size);
+            let geometry = [RemotePaneGeometry { pane: pane.clone(), left: 0, top: 0,
+                cols: 80, rows: 24, floating: false, active: true }];
+            source.assign_pane(&pane);
+            destination.assign_pane(&pane);
+            mux.add_tab_no_panes(&source);
+            mux.add_tab_no_panes(&destination);
+            mux.add_pane(&pane).unwrap();
+            source.sync_remote_layout(&geometry, zoomed).unwrap();
+            destination.sync_remote_layout(&geometry, zoomed).unwrap();
+            assert!(source.remove_pane(pane.pane_id()).is_some());
+            assert!(source.iter_all_panes().is_empty());
+            mux.remove_tab(source.tab_id());
+            assert!(mux.get_pane(pane.pane_id()).is_some());
+            assert_eq!(destination.get_active_pane().unwrap().pane_id(), pane.pane_id());
+        }
+    }
+
+    #[test]
+    fn local_popup_preserves_zoom_and_survives_remote_layout_updates() {
+        Mux::set_mux(&Arc::new(Mux::new(None)));
+        let size = TerminalSize { rows: 24, cols: 80, pixel_width: 800, pixel_height: 480, dpi: 96 };
+        let tab = Tab::new(&size);
+        let tiled = FakePane::new(821, size);
+        tab.assign_pane(&tiled);
+        let geometry = vec![RemotePaneGeometry { pane: tiled.clone(), left: 0, top: 0,
+            cols: 80, rows: 24, floating: false, active: true }];
+        tab.sync_remote_layout(&geometry, true).unwrap();
+        let popup = FakePane::new(822, size);
+        tab.add_popup_pane(size, popup.clone());
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 822);
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 821);
+        tab.sync_remote_layout(&geometry, true).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 822);
+        assert_eq!(tab.get_visible_floating_panes().len(), 1);
+        tab.set_popup_visible(822, false).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 821);
+        assert!(tab.get_visible_floating_panes().is_empty());
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 821);
+    }
+
+    #[test]
+    fn local_popup_resizes_and_recenters_in_remote_tabs() {
+        Mux::set_mux(&Arc::new(Mux::new(None)));
+        let size = TerminalSize { rows: 24, cols: 80, pixel_width: 800, pixel_height: 480, dpi: 96 };
+        let tab = Tab::new(&size);
+        let tiled = FakePane::new(841, size);
+        tab.assign_pane(&tiled);
+        tab.sync_remote_layout(&[RemotePaneGeometry { pane: tiled.clone(), left: 0, top: 0,
+            cols: 80, rows: 24, floating: false, active: true }], false).unwrap();
+        let popup_size = TerminalSize { cols: 60, rows: 10, pixel_width: 600, pixel_height: 200, dpi: 96 };
+        let popup = FakePane::new(842, popup_size);
+        tab.add_popup_pane(popup_size, popup.clone());
+        tab.resize(TerminalSize { cols: 40, rows: 16, pixel_width: 400, pixel_height: 320, dpi: 96 });
+        assert_eq!(popup.get_dimensions().cols, 40);
+        assert_eq!(tab.get_active_floating_pane().unwrap().left, 0);
+        assert_eq!(tab.get_active_floating_pane().unwrap().top, 3);
+        tab.set_popup_visible(842, false).unwrap();
+        tab.resize(size);
+        assert_eq!(popup.get_dimensions().cols, 60);
+        tab.set_popup_visible(842, true).unwrap();
+        assert_eq!(tab.get_active_floating_pane().unwrap().left, 10);
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 842);
+    }
+
+    #[test]
+    fn closing_popup_never_focuses_a_hidden_command_popup() {
+        Mux::set_mux(&Arc::new(Mux::new(None)));
+        let size = TerminalSize { rows: 24, cols: 80, pixel_width: 800, pixel_height: 480, dpi: 96 };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(831, size));
+        for id in [832, 833] {
+            tab.add_popup_pane(size, FakePane::new(id, size));
+        }
+        tab.remove_floating_pane(1).unwrap();
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 831);
+        assert!(!tab.popup_is_visible(832));
+        assert!(tab.get_visible_floating_panes().is_empty());
+    }
+
+    #[test]
+    fn tmux_floats_remain_visible_when_tiled_pane_is_active() {
+        Mux::set_mux(&Arc::new(Mux::new(None)));
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let tiled = FakePane::new(811, size);
+        let floating = FakePane::new(
+            812,
+            TerminalSize {
+                cols: 30,
+                rows: 10,
+                ..size
+            },
+        );
+        tab.assign_pane(&tiled);
+        tab.sync_remote_layout(
+            &[
+                RemotePaneGeometry {
+                    pane: tiled.clone(),
+                    left: 0,
+                    top: 0,
+                    cols: 80,
+                    rows: 24,
+                    floating: false,
+                    active: true,
+                },
+                RemotePaneGeometry {
+                    pane: floating,
+                    left: 8,
+                    top: 4,
+                    cols: 30,
+                    rows: 10,
+                    floating: true,
+                    active: false,
+                },
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(tab.get_visible_floating_panes().len(), 1);
+        assert!(!tab.get_visible_floating_panes()[0].is_active);
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 811);
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {

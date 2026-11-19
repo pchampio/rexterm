@@ -17,9 +17,22 @@ impl crate::TermWindow {
         }
     }
 
+    fn frame_clear_color(&mut self) -> (f32, f32, f32, f32) {
+        // An opaque window must remain opaque while resized/rebuilt quads or
+        // image atlases catch up. Transparent clears expose the desktop in any
+        // temporarily uncovered strip, even with window_background_opacity=1.
+        if self.config.window_background_opacity == 1.0 && self.window_background.is_empty() {
+            let (r, g, b, _) = self.palette().background.to_linear().tuple();
+            (r, g, b, 1.0)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        }
+    }
+
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
+        let (clear_r, clear_g, clear_b, clear_a) = self.frame_clear_color();
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
 
@@ -105,10 +118,10 @@ impl crate::TermWindow {
                                     wgpu::LoadOp::Load
                                 } else {
                                     wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: 0.,
-                                        g: 0.,
-                                        b: 0.,
-                                        a: 0.,
+                                        r: clear_r as f64,
+                                        g: clear_g as f64,
+                                        b: clear_b as f64,
+                                        a: clear_a as f64,
                                     })
                                 },
                                 store: wgpu::StoreOp::Store,
@@ -152,11 +165,12 @@ impl crate::TermWindow {
     fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
         use window::glium::texture::SrgbTexture2d;
 
+        let (clear_r, clear_g, clear_b, clear_a) = self.frame_clear_color();
         let gl_state = self.render_state.as_ref().unwrap();
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
         let tex = tex.downcast_ref::<SrgbTexture2d>().unwrap();
 
-        frame.clear_color(0., 0., 0., 0.);
+        frame.clear_color(clear_r, clear_g, clear_b, clear_a);
 
         let projection = euclid::Transform3D::<f32, f32, f32>::ortho(
             -(self.dimensions.pixel_width as f32) / 2.0,

@@ -42,12 +42,16 @@ pub mod domain;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
+pub mod rex;
+mod rex_bridge;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
 pub mod termwiztermtab;
 pub mod tmux;
+mod tmux_keys;
 pub mod tmux_commands;
+pub mod tmux_strip;
 mod tmux_pty;
 pub mod window;
 
@@ -1282,6 +1286,22 @@ impl Mux {
 
         let term_config = current_pane.get_config();
         Ok((domain, tab_id, current_pane, term_config))
+    }
+
+    pub async fn spawn_popup(
+        &self, pane_id: PaneId, size: TerminalSize,
+        command_builder: Option<CommandBuilder>, command_dir: Option<String>,
+        domain: config::keyassignment::SpawnTabDomain,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let (domain, tab_id, current, term_config) = self
+            .resolve_spawn_tab_domain_from_pane_id(pane_id, domain).await?;
+        let tab = self.get_tab(tab_id).ok_or_else(|| anyhow!("popup tab disappeared"))?;
+        let cwd = self.resolve_cwd(command_dir, Some(current), domain.domain_id(), CachePolicy::FetchImmediate);
+        let pane = domain.spawn_pane(size, command_builder, cwd).await?;
+        Self::apply_config_to_pane(pane.clone(), term_config);
+        self.add_pane(&pane)?;
+        tab.add_popup_pane(size, pane.clone());
+        Ok(pane)
     }
 
     pub async fn spawn_floating_pane(

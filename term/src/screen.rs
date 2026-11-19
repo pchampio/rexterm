@@ -45,6 +45,16 @@ pub struct Screen {
     pub dpi: u32,
 
     pub(crate) saved_cursor: Option<SavedCursor>,
+
+    /// Resize like tmux (a tmux -CC mirror previewing a resize): the rows
+    /// under the cursor stay, so the cursor keeps its row and rewrapped
+    /// lines push the top into the scrollback instead of moving down.
+    pub(crate) keep_rows_below_cursor: bool,
+
+    /// Rows that a resize must follow through the rewrap (the first row of
+    /// the shell prompt, the row where a line editor started). The caller
+    /// sets them before `resize` and reads the new indexes after it.
+    pub(crate) tracked_rows: [Option<PhysRowIndex>; 2],
 }
 
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
@@ -87,6 +97,8 @@ impl Screen {
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
+            keep_rows_below_cursor: false,
+            tracked_rows: [None, None],
         }
     }
 
@@ -110,10 +122,19 @@ impl Screen {
         let mut logical_line: Option<Line> = None;
         let mut logical_cursor_x: Option<usize> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
+        let tracked = std::mem::take(&mut self.tracked_rows);
+        let mut tracked_offset: [Option<usize>; 2] = [None, None];
 
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
+            for (slot, row) in tracked.iter().enumerate() {
+                if *row == Some(phys_idx) {
+                    // Cells that precede the tracked row in its logical line.
+                    tracked_offset[slot] =
+                        Some(logical_line.as_ref().map(|l| l.len()).unwrap_or(0));
+                }
+            }
 
             if was_wrapped {
                 line.set_last_cell_was_wrapped(false, seqno);
@@ -140,6 +161,13 @@ impl Screen {
                 continue;
             }
 
+            for (slot, offset) in tracked_offset.iter_mut().enumerate() {
+                if let Some(offset) = offset.take() {
+                    self.tracked_rows[slot] = Some(rewrapped.len() + offset / physical_cols);
+                }
+            }
+
+            let mut cursor_row_in_line = None;
             if let Some(x) = logical_cursor_x.take() {
                 let num_lines = x / physical_cols;
                 let last_x = x - (num_lines * physical_cols);
@@ -150,7 +178,11 @@ impl Screen {
                 // line and it won't resize with the line correctly.
                 // Put it back on the prior line. The cursor is now
                 // technically outside of the viewport width.
-                if adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
+                // This is only for a cursor inside a wrapped line. A cursor
+                // on the first cell of its own line (a program between two
+                // lines of output) must stay there: on the row above, the
+                // next line of output would overwrite the last one.
+                if adjusted_cursor.0 == 0 && num_lines > 0 {
                     if physical_cols < self.physical_cols {
                         // getting smaller: preserve its original position
                         // on the prior line
@@ -163,15 +195,28 @@ impl Screen {
                     }
                     adjusted_cursor.1 -= 1;
                 }
+                cursor_row_in_line = adjusted_cursor.1.checked_sub(rewrapped.len());
             }
 
-            if line.len() <= physical_cols {
-                rewrapped.push_back(line);
+            let mut pieces = if line.len() <= physical_cols {
+                vec![line]
             } else {
-                for line in line.wrap(physical_cols, seqno) {
-                    rewrapped.push_back(line);
+                line.wrap(physical_cols, seqno)
+            };
+            // Blank cells at the end of the line are not kept, so the
+            // cursor can be on a row after the last row of text. That row
+            // still belongs to this logical line (a prompt that fills its
+            // last row, with the cursor after it): keep the two linked.
+            if let Some(row) = cursor_row_in_line {
+                if row >= pieces.len() {
+                    if let Some(last) = pieces.last_mut() {
+                        if last.len() >= physical_cols {
+                            last.set_last_cell_was_wrapped(true, seqno);
+                        }
+                    }
                 }
             }
+            rewrapped.extend(pieces);
         }
         self.lines = rewrapped;
 
@@ -217,9 +262,22 @@ impl Screen {
         // this avoids growing the scrollback size when rapidly switching between normal and
         // maximized states.
         let cursor_phys = self.phys_row(cursor.y);
-        for _ in cursor_phys + 1..self.lines.len() {
-            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
+        if self.keep_rows_below_cursor {
+            // tmux: a shorter screen drops blank rows under the cursor
+            // first; every other row under the cursor stays.
+            let mut drop = self.physical_rows.saturating_sub(physical_rows);
+            while drop > 0
+                && self.lines.len() > cursor_phys + 1
+                && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
+            {
                 self.lines.pop_back();
+                drop -= 1;
+            }
+        } else {
+            for _ in cursor_phys + 1..self.lines.len() {
+                if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
+                    self.lines.pop_back();
+                }
             }
         }
 
@@ -324,6 +382,29 @@ impl Screen {
             visibility: cursor.visibility,
             seqno,
         }
+    }
+
+    /// Remove rows of the scrollback that are directly above the visible
+    /// screen: the first rows of a shell prompt that is taller than a very
+    /// narrow screen. The shell redraws its prompt and cannot reach them.
+    pub(crate) fn remove_scrollback_rows(&mut self, rows: std::ops::Range<PhysRowIndex>) {
+        let top = self.lines.len().saturating_sub(self.physical_rows);
+        let end = rows.end.min(top);
+        if rows.start < end {
+            self.lines.drain(rows.start..end);
+        }
+    }
+
+    /// Import an authoritative remote snapshot without reinterpreting Unicode
+    /// widths, wrapping, links or semantic attributes as a new output stream.
+    pub fn import_remote_lines(&mut self, mut lines: Vec<Line>, seqno: SequenceNo) {
+        let limit=self.physical_rows+scrollback_size(&self.config,self.allow_scrollback);
+        let skipped=lines.len().saturating_sub(limit);
+        if skipped>0 {lines.drain(..skipped);}
+        for line in &mut lines {line.update_last_change_seqno(seqno);}
+        while lines.len()<self.physical_rows {lines.push(Line::new(seqno));}
+        self.lines=lines.into();
+        self.stable_row_index_offset=skipped;
     }
 
     /// Get mutable reference to a line, relative to start of scrollback.
@@ -898,6 +979,65 @@ impl Screen {
         }
     }
 
+    /// True if any cell in the physical row range carries an image.
+    pub fn has_images_in_phys_range(&self, phys_range: Range<PhysRowIndex>) -> bool {
+        self.lines
+            .iter()
+            .skip(phys_range.start)
+            .take(phys_range.end.saturating_sub(phys_range.start))
+            .any(|line| line.visible_cells().any(|cell| cell.attrs().images().is_some()))
+    }
+
+    /// Image pieces in a range, as (row counted from the last line, column,
+    /// images). Used to keep imgcat output across an exact tmux redraw.
+    pub fn image_cells_in_phys_range(
+        &self,
+        phys_range: Range<PhysRowIndex>,
+    ) -> Vec<(usize, usize, Vec<wezterm_cell::image::ImageCell>)> {
+        let total = self.lines.len();
+        let mut found = vec![];
+        for (idx, line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .skip(phys_range.start)
+            .take(phys_range.end.saturating_sub(phys_range.start))
+        {
+            for cell in line.visible_cells() {
+                if let Some(images) = cell.attrs().images() {
+                    found.push((total - 1 - idx, cell.cell_index(), images));
+                }
+            }
+        }
+        found
+    }
+
+    /// Reattach image pieces taken by image_cells_in_phys_range to cells
+    /// that are still blank and carry no image of their own.
+    pub fn restore_image_cells(
+        &mut self,
+        cells: Vec<(usize, usize, Vec<wezterm_cell::image::ImageCell>)>,
+        seqno: SequenceNo,
+    ) {
+        let total = self.lines.len();
+        for (from_bottom, x, images) in cells {
+            if from_bottom >= total {
+                continue;
+            }
+            let line = &mut self.lines[total - 1 - from_bottom];
+            let Some(mut cell) = line.get_cell(x).map(|c| c.as_cell()) else {
+                continue;
+            };
+            if cell.attrs().images().is_some() || !cell.str().trim().is_empty() {
+                continue;
+            }
+            for image in images {
+                cell.attrs_mut().attach_image(Box::new(image));
+            }
+            line.set_cell(x, cell, seqno);
+        }
+    }
+
     pub fn lines_in_phys_range(&self, phys_range: Range<PhysRowIndex>) -> Vec<Line> {
         self.lines
             .iter()
@@ -1071,6 +1211,49 @@ impl Screen {
     pub fn for_each_logical_line_in_stable_range<F>(
         &self,
         stable_range: Range<StableRowIndex>,
+        f: F,
+    ) where
+        F: FnMut(Range<StableRowIndex>, &[&Line]) -> bool,
+    {
+        self.for_each_line_group_in_stable_range(stable_range, false, f)
+    }
+
+    /// Like for_each_logical_line_in_stable_range, but a row that is full up
+    /// to the last column and is followed by a row starting with text is
+    /// also joined. Applications that draw their own wrapping (nvim, TUIs,
+    /// a multiplexer redraw) never set the wrap flag; searches and quick
+    /// select still see one line, as displayed.
+    pub fn for_each_display_line_in_stable_range<F>(
+        &self,
+        stable_range: Range<StableRowIndex>,
+        f: F,
+    ) where
+        F: FnMut(Range<StableRowIndex>, &[&Line]) -> bool,
+    {
+        self.for_each_line_group_in_stable_range(stable_range, true, f)
+    }
+
+    fn row_continues(&self, idx: PhysRowIndex, join_full_rows: bool) -> bool {
+        let Some(line) = self.lines.get(idx) else {
+            return false;
+        };
+        if line.last_cell_was_wrapped() {
+            return true;
+        }
+        if !join_full_rows || self.physical_cols == 0 {
+            return false;
+        }
+        let filled = |cell: Option<wezterm_surface::line::CellRef<'_>>| {
+            cell.map_or(false, |c| !c.str().trim().is_empty())
+        };
+        filled(line.get_cell(self.physical_cols - 1))
+            && self.lines.get(idx + 1).map_or(false, |next| filled(next.get_cell(0)))
+    }
+
+    fn for_each_line_group_in_stable_range<F>(
+        &self,
+        stable_range: Range<StableRowIndex>,
+        join_full_rows: bool,
         mut f: F,
     ) where
         F: FnMut(Range<StableRowIndex>, &[&Line]) -> bool,
@@ -1087,7 +1270,7 @@ impl Screen {
         let mut back_len = 0;
         while phys_range.start > 0 {
             let prior = &self.lines[phys_range.start - 1];
-            if !prior.last_cell_was_wrapped() {
+            if !self.row_continues(phys_range.start - 1, join_full_rows) {
                 break;
             }
             if prior.len() + back_len > MAX_LOGICAL_LINE_LEN {
@@ -1113,7 +1296,7 @@ impl Screen {
                     end_inclusive = idx;
                     total_len += line.len();
                     line_vec.push(line);
-                    if !line.last_cell_was_wrapped() {
+                    if !self.row_continues(idx, join_full_rows) {
                         break;
                     }
                 } else if idx == phys_row {

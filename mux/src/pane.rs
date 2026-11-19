@@ -278,6 +278,24 @@ pub trait Pane: Downcast + Send + Sync {
     fn kill(&self) {}
     fn palette(&self) -> ColorPalette;
     fn domain_id(&self) -> DomainId;
+    fn wants_native_scroll(&self) -> bool {
+        false
+    }
+    /// Copy viewport position and body height, parsed with the displayed frame.
+    /// A GUI copy viewport, expressed as distance above the live bottom.
+    fn copy_mode_scroll_position(&self) -> Option<(isize, usize)> { None }
+
+    fn tmux_copy_scroll_position(&self) -> Option<(isize, usize)> {
+        None
+    }
+    fn has_server_frame(&self) -> bool {
+        false
+    }
+    /// A tmux display-popup shown as a floating pane: the GUI draws its frame
+    /// and title in the border cells around it (tmux draws no border).
+    fn popup_frame(&self) -> Option<PopupFrame> {
+        None
+    }
 
     fn get_keyboard_encoding(&self) -> KeyboardEncoding {
         KeyboardEncoding::Xterm
@@ -374,7 +392,19 @@ pub enum CachePolicy {
 /// with the Pane::with_lines_mut method.
 /// Ideally we'd simply pass an FnMut with the same signature as the trait
 /// method defined here, but doing so results in Pane not being object-safe.
+/// Server-owned selection styles and endpoints from the same mode snapshot.
+#[derive(Clone, Debug)]
+pub struct TmuxCopySelection {
+    pub endpoints: [i64; 8], // sx, sy, ex, ey, kind (0=char, 1=rect, 2=line), vi, clipx, dragged end
+    pub plain: Vec<Line>,
+    pub styled: Vec<Line>,
+}
+
 pub trait WithPaneLines {
+    fn set_tmux_copy_selection(&mut self, _selection: Option<Arc<TmuxCopySelection>>) {}
+
+    /// Mode metadata delivered under the same terminal lock as the cells.
+    fn set_tmux_copy_scroll_position(&mut self, _position: Option<(isize, usize)>, _cursor: StableCursorPosition) {}
     /// The `first_row` parameter is set to the StableRowIndex of the resolved
     /// first row from the Pane::with_lines_mut method. It will usually be
     /// the start of the lines range, but in case that row is no longer in
@@ -1108,4 +1138,17 @@ mod test {
             _ => unreachable!(),
         }
     }
+}
+
+/// Frame of a tmux popup that the GUI draws itself (see Pane::popup_frame).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PopupFrame {
+    /// tmux border style, such as `fg=colour001`.
+    pub border_style: String,
+    /// Title, with tmux `#[...]` style runs.
+    pub title: String,
+    /// A line between the title and the terminal that stays when the
+    /// terminal scrolls (an agent shell shows its command there). The pane
+    /// is one row shorter to leave room for it.
+    pub subtitle: String,
 }

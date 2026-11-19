@@ -124,6 +124,15 @@ pub enum LocalPaneConnectionState {
 pub struct LocalPane {
     pane_id: PaneId,
     terminal: Mutex<Terminal>,
+    tmux_status: Mutex<Option<Terminal>>,
+    tmux_status_snapshot: Mutex<Vec<u8>>,
+    tmux_surface_snapshot: Mutex<Option<(usize, usize, Vec<u8>)>>,
+    tmux_selection_cache: Mutex<Option<(String, usize, usize, Arc<crate::pane::TmuxCopySelection>)>>,
+    tmux_overlay: std::sync::atomic::AtomicBool,
+    tmux_popup_frame: Mutex<Option<crate::pane::PopupFrame>>,
+    tmux_client: std::sync::atomic::AtomicBool,
+    tmux_strip_hidden: std::sync::atomic::AtomicBool,
+    tmux_prompt_cursor: Mutex<Option<usize>>,
     process: Mutex<ProcessState>,
     pty: Mutex<Box<dyn MasterPty>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -164,15 +173,26 @@ impl Pane for LocalPane {
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
-        let mut cursor = terminal_get_cursor_position(&mut self.terminal.lock());
+        let mut cursor = self.cursor_for_terminal(&mut self.terminal.lock());
         if self.tmux_domain.lock().is_some() {
             cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
+        }
+        if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if !tmux.cursor_is_active(self.pane_id) {
+                    cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
+                }
+            }
         }
         cursor
     }
 
     fn get_keyboard_encoding(&self) -> KeyboardEncoding {
-        if self.tmux_domain.lock().is_some() {
+        if self.tmux_client.load(std::sync::atomic::Ordering::Relaxed)
+            || self.tmux_domain.lock().is_some()
+        {
+            // tmux owns application keyboard negotiation; keep GUI input on
+            // the symbolic key path instead of writing encoded bytes directly.
             KeyboardEncoding::Xterm
         } else {
             self.terminal.lock().get_keyboard_encoding()
@@ -188,7 +208,11 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        terminal_get_dirty_lines(&mut self.terminal.lock(), lines, seqno)
+        let mut dirty = terminal_get_dirty_lines(&mut self.terminal.lock(), lines.clone(), seqno);
+        if self.tmux_status.lock().is_some() && lines.start < lines.end {
+            dirty.add(lines.end - 1);
+        }
+        dirty
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -204,7 +228,11 @@ impl Pane for LocalPane {
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        terminal_with_lines_mut(&mut self.terminal.lock(), lines, with_lines)
+        if let Some((alt_top, primary)) = self.tmux_mode_images() {
+            let mut merged = ModeImages { inner: with_lines, alt_top, primary };
+            return self.with_lines_mut_impl(lines, &mut merged);
+        }
+        self.with_lines_mut_impl(lines, with_lines)
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
@@ -216,7 +244,12 @@ impl Pane for LocalPane {
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        terminal_get_dimensions(&mut self.terminal.lock())
+        let mut dims = terminal_get_dimensions(&mut self.terminal.lock());
+        if self.tmux_status.lock().is_some() {
+            dims.viewport_rows += 1;
+            dims.scrollback_rows += 1;
+        }
+        dims
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
@@ -288,6 +321,7 @@ impl Pane for LocalPane {
                 };
 
                 if let Some(status) = status {
+                    self.terminal.lock().program_status_process_exited();
                     let success = match status.success() {
                         true => true,
                         false => configuration()
@@ -393,6 +427,15 @@ impl Pane for LocalPane {
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
+        if self.tmux_client.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    if tmux.inner.send_client_mouse(self.pane_id, event)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         self.terminal.lock().mouse_event(event)
     }
 
@@ -405,16 +448,33 @@ impl Pane for LocalPane {
             }
             return Ok(());
         } else {
+            // Preserve the server's actual key tables, prefix state and plugins.
+            // Encoded PTY bytes cannot represent a client binding (send-keys -H
+            // intentionally bypasses that binding layer).
+            if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                    if tmux.inner.send_client_key(self.pane_id, key, mods)? {
+                        return Ok(());
+                    }
+                }
+            }
             self.terminal.lock().key_down(key, mods)
         }
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
+        // The server's client key engine receives key presses. Sending a raw
+        // application-encoded release as well bypasses that engine and can be
+        // interpreted as another key by an application behind tmux.
+        if self.tmux_client.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         Mux::get().record_input_for_current_identity();
         self.terminal.lock().key_up(key, mods)
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), Error> {
+        let size = self.resize_status_row(size);
         self.pty.lock().resize(PtySize {
             rows: size.rows.try_into()?,
             cols: size.cols.try_into()?,
@@ -439,6 +499,13 @@ impl Pane for LocalPane {
 
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
+        if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if tmux.inner.send_client_paste(self.pane_id, text)? {
+                    return Ok(());
+                }
+            }
+        }
         if self.tmux_domain.lock().is_some() {
             Ok(())
         } else {
@@ -447,6 +514,13 @@ impl Pane for LocalPane {
     }
 
     fn get_title(&self) -> String {
+        if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                if let Some(title) = tmux.client_title() {
+                    return title;
+                }
+            }
+        }
         let title = self.terminal.lock().get_title().to_string();
         // If the title is the default pane title, then try to spice
         // things up a bit by returning the process basename instead
@@ -468,6 +542,14 @@ impl Pane for LocalPane {
 
     fn palette(&self) -> ColorPalette {
         self.terminal.lock().palette()
+    }
+
+    fn has_server_frame(&self) -> bool {
+        self.tmux_overlay.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn popup_frame(&self) -> Option<crate::pane::PopupFrame> {
+        self.tmux_popup_frame.lock().clone()
     }
 
     fn domain_id(&self) -> DomainId {
@@ -493,7 +575,29 @@ impl Pane for LocalPane {
         self.terminal.lock().has_unseen_output()
     }
 
+    fn tmux_copy_scroll_position(&self) -> Option<(isize, usize)> {
+        self.copy_scroll_for_terminal(&self.terminal.lock())
+    }
+
+    fn wants_native_scroll(&self) -> bool {
+        let virtual_pane = Mux::get()
+            .get_domain(self.domain_id)
+            .and_then(|d| {
+                d.downcast_ref::<TmuxDomain>()
+                    .map(|t| t.is_virtual_pane(self.pane_id))
+            })
+            .unwrap_or(false);
+        let term = self.terminal.lock();
+        self.tmux_client.load(std::sync::atomic::Ordering::Relaxed)
+            && !virtual_pane
+            && !term.is_mouse_grabbed()
+            && !term.is_alt_screen_active()
+    }
+
     fn is_mouse_grabbed(&self) -> bool {
+        if self.tmux_client.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         if self.tmux_domain.lock().is_some() {
             false
         } else {
@@ -678,7 +782,7 @@ impl Pane for LocalPane {
         let mut results = vec![];
         let mut uniq_matches: HashMap<String, usize> = HashMap::new();
 
-        screen.for_each_logical_line_in_stable_range(range, |sr, lines| {
+        screen.for_each_display_line_in_stable_range(range, |sr, lines| {
             if let Some(limit) = limit {
                 if results.len() == limit as usize {
                     // We've reach the limit, stop iteration.
@@ -866,6 +970,10 @@ pub(crate) fn emit_output_for_pane(pane_id: PaneId, message: &str) {
 impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
     fn handle_device_control(&mut self, control: termwiz::escape::DeviceControlMode) {
         match control {
+            DeviceControlMode::ShortDeviceControl(packet)
+                if packet.intermediates == [b'+'] && packet.byte == b'r' => {
+                crate::rex_bridge::handle(self.pane_id, packet.data);
+            }
             DeviceControlMode::Enter(mode) => {
                 if !mode.ignored_extra_intermediates
                     && mode.params.len() == 1
@@ -1003,6 +1111,194 @@ fn split_child(
 }
 
 impl LocalPane {
+    pub(crate) fn set_tmux_prompt_cursor(&self, cursor: Option<usize>) {
+        *self.tmux_prompt_cursor.lock() = cursor;
+    }
+
+    pub(crate) fn mark_tmux_client(&self) {
+        self.tmux_client
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Publish an entire UI surface while holding the terminal lock. PTY
+    /// writes can be parsed separately, exposing the clear before the labels.
+    /// Hide the bottom row of the window chrome (the continuous window tab
+    /// strip) while a GUI overlay, such as click copy, shows its indicator
+    /// in a pane status row. The strip returns from the last snapshot.
+    pub fn set_tmux_strip_hidden(&self, hidden: bool) {
+        let snapshot = self.tmux_surface_snapshot.lock();
+        if self.tmux_strip_hidden.swap(hidden, std::sync::atomic::Ordering::Relaxed) == hidden {
+            return;
+        }
+        let mut terminal = self.terminal.lock();
+        if hidden {
+            let rows = terminal.get_size().rows;
+            terminal.advance_bytes(format!("\x1b[{rows};1H\x1b[0m\x1b[2K").as_bytes());
+        } else if let Some((_, _, bytes)) = snapshot.as_ref() {
+            terminal.advance_bytes(bytes);
+        }
+        drop(terminal);
+        drop(snapshot);
+        Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
+    }
+
+    pub(crate) fn set_tmux_surface(&self, bytes: &[u8]) {
+        let mut snapshot = self.tmux_surface_snapshot.lock();
+        let mut terminal = self.terminal.lock();
+        let size = terminal.get_size();
+        if snapshot.as_ref().map(|(cols, rows, old)|
+            *cols == size.cols && *rows == size.rows && old.as_slice() == bytes
+        ).unwrap_or(false) { return; }
+        terminal.advance_bytes(bytes);
+        if self.tmux_strip_hidden.load(std::sync::atomic::Ordering::Relaxed) {
+            terminal.advance_bytes(format!("\x1b[{};1H\x1b[0m\x1b[2K", size.rows).as_bytes());
+        }
+        *snapshot = Some((size.cols, size.rows, bytes.to_vec()));
+        drop(terminal);
+        drop(snapshot);
+        Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
+    }
+
+    pub(crate) fn mark_tmux_chrome(&self) {
+        self.mark_tmux_surface();
+        self.terminal.lock().palette_mut().background.3 = 0.0;
+    }
+
+    pub(crate) fn mark_tmux_surface(&self) {
+        self.mark_tmux_overlay();
+        // Snapshot surfaces have explicit rows and columns. They must not
+        // reflow into history when a resize races with an older snapshot.
+        self.terminal.lock().advance_bytes(b"\x1b[?1049h\x1b[?7l");
+    }
+
+    pub(crate) fn set_tmux_popup_frame(&self, frame: Option<crate::pane::PopupFrame>) {
+        *self.tmux_popup_frame.lock() = frame;
+    }
+
+    pub(crate) fn mark_tmux_overlay(&self) {
+        self.tmux_overlay
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Resizes the tmux status row; returns the size left for the terminal.
+    fn resize_status_row(&self, mut size: TerminalSize) -> TerminalSize {
+        if let Some(status) = self.tmux_status.lock().as_mut() {
+            let mut status_size = size;
+            status_size.rows = 1;
+            if status.get_size().cols != status_size.cols {
+                self.tmux_status_snapshot.lock().clear();
+            }
+            status.resize(status_size);
+            size.rows = size.rows.saturating_sub(1).max(1);
+        }
+        size
+    }
+
+    /// Reflows the local terminal (a tmux separator drag) without telling
+    /// the pty: tmux is resized once, when the drag ends.
+    pub(crate) fn resize_terminal_only(&self, size: TerminalSize) {
+        let size = self.resize_status_row(size);
+        // Like tmux, so nothing jumps when tmux's own screen arrives.
+        self.terminal.lock().resize_like_tmux(size);
+        Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
+    }
+
+    pub(crate) fn ensure_tmux_status(&self) {
+        let missing = self.tmux_status.lock().is_none();
+        if missing {
+            self.set_tmux_status(&[]);
+        }
+    }
+
+    pub(crate) fn set_tmux_status(&self, bytes: &[u8]) {
+        let mut status_guard = self.tmux_status.lock();
+        let mut snapshot = self.tmux_status_snapshot.lock();
+        if status_guard.is_some() && snapshot.as_slice() == bytes {
+            return;
+        }
+        snapshot.clear();
+        snapshot.extend_from_slice(bytes);
+        let mut terminal = self.terminal.lock();
+        if status_guard.is_none() {
+            let mut size = terminal.get_size();
+            size.rows = 1;
+            *status_guard = Some(Terminal::new(
+                size,
+                terminal.get_config(),
+                "WezTerm",
+                config::wezterm_version(),
+                Box::new(std::io::sink()),
+            ));
+            // A status row is UI, not scrollback: resizing must not reflow it.
+            status_guard.as_mut().unwrap().advance_bytes(b"\x1b[?1049h");
+            let mut size = terminal.get_size();
+            size.rows = size.rows.saturating_sub(1).max(1);
+            terminal.resize(size);
+        }
+        let status = status_guard.as_mut().unwrap();
+        status.advance_bytes(b"\x0f\x1b[0m\x1b)0\x1b[?7l\x1b[H\x1b[2J");
+        status.advance_bytes(bytes);
+        // Bump the pane sequence so the GUI repaints the status row. Never
+        // inject bytes into the application terminal here: DECSC would
+        // overwrite the application's saved cursor (an instant prompt then
+        // restores to the wrong row), and injected bytes can split an escape
+        // sequence that the reader thread is in the middle of parsing.
+        terminal.increment_seqno();
+        drop(terminal);
+        drop(status_guard);
+        // Status snapshots bypass the PTY reader, so they must explicitly
+        // invalidate the visible pane even when the application is idle.
+        Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
+    }
+
+    fn cursor_for_terminal(&self, terminal: &mut Terminal) -> StableCursorPosition {
+        let mut cursor = terminal_get_cursor_position(terminal);
+        if let Some(x) = *self.tmux_prompt_cursor.lock() {
+            let dims = terminal_get_dimensions(terminal);
+            cursor.x = x;
+            cursor.y = dims.physical_top + dims.viewport_rows as isize;
+            cursor.visibility = termwiz::surface::CursorVisibility::Visible;
+        }
+        cursor
+    }
+
+    fn copy_selection_for_terminal(&self, terminal: &Terminal) -> Option<Arc<crate::pane::TmuxCopySelection>> {
+        use base64::Engine;
+        if self.copy_scroll_for_terminal(terminal).is_none() { return None; }
+        let text = terminal.user_vars().get("WEZTERM_TMUX_COPY_SELECTION")?;
+        if text.is_empty() { self.tmux_selection_cache.lock().take(); return None; }
+        let size = terminal.get_size();
+        let mut cache = self.tmux_selection_cache.lock();
+        if let Some((old, cols, rows, selection)) = cache.as_ref() {
+            if old == text && *cols == size.cols && *rows == size.rows { return Some(selection.clone()); }
+        }
+        let mut parts = text.split('|');
+        let values: Vec<i64> = parts.next()?.split_whitespace().map(str::parse).collect::<Result<_, _>>().ok()?;
+        let endpoints: [i64; 8] = values.try_into().ok()?;
+        let mut variants = Vec::new();
+        for _ in 0..2 {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(parts.next()?).ok()?;
+            let escaped = String::from_utf8(bytes).ok()?;
+            let raw = termwiz::tmux_cc::unvis(&escaped).ok()?;
+            let raw = crate::tmux_keys::tmux_acs_extensions(&raw);
+            let raw = raw.strip_suffix('\n').unwrap_or(&raw).replace('\n', "\r\n");
+            let mut term = Terminal::new(size, terminal.get_config(), "WezTerm", config::wezterm_version(), Box::new(std::io::sink()));
+            term.advance_bytes(b"\x1b[?1049h\x0f\x1b)0\x1b[?7l");
+            term.advance_bytes(raw.as_bytes());
+            let top = terminal_get_dimensions(&mut term).physical_top;
+            variants.push(terminal_get_lines(&mut term, top..top + size.rows as isize).1);
+        }
+        let selection = Arc::new(crate::pane::TmuxCopySelection { endpoints, plain: variants.remove(0), styled: variants.remove(0) });
+        *cache = Some((text.clone(), size.cols, size.rows, selection.clone()));
+        Some(selection)
+    }
+
+    fn copy_scroll_for_terminal(&self, term: &Terminal) -> Option<(isize, usize)> {
+        if !self.tmux_client.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        let position = term.user_vars().get("WEZTERM_TMUX_COPY_SCROLL")?.parse().ok()?;
+        Some((position, term.get_size().rows))
+    }
+
     pub fn new(
         pane_id: PaneId,
         mut terminal: Terminal,
@@ -1023,6 +1319,15 @@ impl LocalPane {
         Self {
             pane_id,
             terminal: Mutex::new(terminal),
+            tmux_status: Mutex::new(None),
+            tmux_status_snapshot: Mutex::new(Vec::new()),
+            tmux_surface_snapshot: Mutex::new(None),
+            tmux_selection_cache: Mutex::new(None),
+            tmux_overlay: std::sync::atomic::AtomicBool::new(false),
+            tmux_popup_frame: Mutex::new(None),
+            tmux_client: std::sync::atomic::AtomicBool::new(false),
+            tmux_strip_hidden: std::sync::atomic::AtomicBool::new(false),
+            tmux_prompt_cursor: Mutex::new(None),
             process: Mutex::new(ProcessState::Running {
                 child_waiter: process,
                 pid,
@@ -1159,5 +1464,123 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+impl LocalPane {
+    fn with_lines_mut_impl(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
+        let mut status = self.tmux_status.lock();
+        if let Some(status) = status.as_mut() {
+            // The border/status row belongs to the client UI, never to the
+            // application scrollback. Keep it pinned while native scrolling.
+            // Resizing can reflow the one-row terminal into scrollback. Stable
+            // row zero then contains an old tab strip, not the current status.
+            let top = terminal_get_dimensions(status).physical_top;
+            let (_, mut status_lines) = terminal_get_lines(status, top..top + 1);
+            let Some(status_line) = status_lines.first_mut() else {
+                return;
+            };
+            let mut terminal = self.terminal.lock();
+            with_lines.set_tmux_copy_selection(self.copy_selection_for_terminal(&terminal));
+            with_lines.set_tmux_copy_scroll_position(self.copy_scroll_for_terminal(&terminal), self.cursor_for_terminal(&mut terminal));
+            let dims = terminal_get_dimensions(&mut terminal);
+            let status_row = dims.physical_top + dims.viewport_rows as isize;
+            let pinned_viewport = lines.end - lines.start == dims.viewport_rows as isize + 1;
+            if !pinned_viewport && !(lines.start <= status_row && status_row < lines.end) {
+                terminal_with_lines_mut(&mut terminal, lines, with_lines);
+                return;
+            }
+            let screen = terminal.screen_mut();
+            let content = lines.start..if pinned_viewport {
+                lines.end.saturating_sub(1)
+            } else {
+                lines.end.min(status_row)
+            };
+            let physical = screen.stable_range(&content);
+            let first = if physical.is_empty() {
+                lines.start
+            } else {
+                screen.phys_to_stable_row_index(physical.start)
+            };
+            screen.with_phys_lines_mut(physical, |content| {
+                let mut combined: Vec<&mut Line> = content.iter_mut().map(|l| &mut **l).collect();
+                combined.push(status_line);
+                with_lines.with_lines_mut(first, &mut combined);
+            });
+        } else {
+            let mut terminal = self.terminal.lock();
+            with_lines.set_tmux_copy_selection(self.copy_selection_for_terminal(&terminal));
+            with_lines.set_tmux_copy_scroll_position(self.copy_scroll_for_terminal(&terminal), self.cursor_for_terminal(&mut terminal));
+            terminal_with_lines_mut(&mut terminal, lines, with_lines)
+        }
+    }
+
+    /// While a tmux mode screen (copy mode) replaces the primary screen,
+    /// return the alt screen's first stable row and the primary/history lines
+    /// shown at each mode row. tmux mode captures are text only; images live
+    /// in the native history.
+    fn tmux_mode_images(&self) -> Option<(StableRowIndex, Vec<Line>)> {
+        let terminal = self.terminal.lock();
+        if !terminal.tmux_mode_replaces_primary() {
+            return None;
+        }
+        let (position, rows) = self.copy_scroll_for_terminal(&terminal)?;
+        let primary = terminal.primary_screen();
+        let total = primary.scrollback_rows() as isize;
+        let start = total - rows as isize - position;
+        let end = (start + rows as isize).min(total);
+        if end <= 0 {
+            return None;
+        }
+        // Runs every frame in copy mode: test in place, copy only with images.
+        let range = start.max(0) as usize..end as usize;
+        if !primary.has_images_in_phys_range(range.clone()) {
+            return None;
+        }
+        let mut lines = vec![Line::with_width(0, 0); (-start).max(0) as usize];
+        lines.extend(primary.lines_in_phys_range(range));
+        let alt_top = terminal.screen().visible_row_to_stable_row(0);
+        Some((alt_top, lines))
+    }
+}
+
+struct ModeImages<'a> {
+    inner: &'a mut dyn WithPaneLines,
+    alt_top: StableRowIndex,
+    primary: Vec<Line>,
+}
+
+impl WithPaneLines for ModeImages<'_> {
+    fn set_tmux_copy_selection(&mut self, selection: Option<Arc<crate::pane::TmuxCopySelection>>) {
+        self.inner.set_tmux_copy_selection(selection)
+    }
+    fn set_tmux_copy_scroll_position(&mut self, position: Option<(isize, usize)>, cursor: StableCursorPosition) {
+        self.inner.set_tmux_copy_scroll_position(position, cursor)
+    }
+    fn with_lines_mut(&mut self, first_row: StableRowIndex, lines: &mut [&mut Line]) {
+        let mut merged: Vec<Line> = Vec::with_capacity(lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            let mut line: Line = (**line).clone();
+            let row = first_row + i as StableRowIndex - self.alt_top;
+            if let Some(src) = (row >= 0).then(|| self.primary.get(row as usize)).flatten() {
+                for x in 0..src.len() {
+                    let Some(images) = src.get_cell(x).and_then(|c| c.attrs().images()) else {
+                        continue;
+                    };
+                    if line.len() <= x {
+                        let seqno = line.current_seqno();
+                        line.resize(x + 1, seqno);
+                    }
+                    if let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(x) {
+                        for image in images {
+                            cell.attrs_mut().attach_image(Box::new(image));
+                        }
+                    }
+                }
+            }
+            merged.push(line);
+        }
+        let mut refs: Vec<&mut Line> = merged.iter_mut().collect();
+        self.inner.with_lines_mut(first_row, &mut refs);
     }
 }

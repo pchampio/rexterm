@@ -45,6 +45,7 @@ lazy_static::lazy_static! {
 
 /// Tracks the horizontal tab stops for a terminal screen.
 /// Tab stops are stored as a boolean vector, one entry per column.
+#[derive(Clone)]
 pub(crate) struct TabStop {
     tabs: Vec<bool>,
     tab_width: usize,
@@ -149,6 +150,7 @@ pub(crate) struct SavedCursor {
     // TODO: selective_erase when supported
 }
 
+#[derive(Clone)]
 struct ScreenOrAlt {
     /// The primary screen + scrollback
     screen: Screen,
@@ -251,11 +253,78 @@ impl ScreenOrAlt {
     }
 }
 
+/// The most rows of an old prompt that a prompt redraw removes from the
+/// scrollback (see `move_to_prompt_anchor`).
+const MAX_PROMPT_ROWS_IN_SCROLLBACK: isize = 4096;
+
 /// Manages the state for the terminal
+struct ResizePreview {
+    screen: ScreenOrAlt,
+    cursor: CursorPosition,
+    wrap_next: bool,
+    size: TerminalSize,
+    rows: Range<VisibleRowIndex>,
+    cols: Range<usize>,
+    tabs: TabStop,
+    prompt_anchor: Option<StableRowIndex>,
+    prompt_resized: bool,
+    editor_redraw: u8,
+    editor_anchor: Option<StableRowIndex>,
+}
+
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
 
     screen: ScreenOrAlt,
+    resize_preview: Option<ResizePreview>,
+    /// First row of the shell prompt that is on screen now, on the primary
+    /// screen: the row of the first text after OSC 133 A (a shell can print
+    /// an empty line between A and its prompt), or the row of OSC 133 P when
+    /// the shell sends no A. A resize follows it through the rewrap.
+    prompt_anchor: Option<StableRowIndex>,
+    /// OSC 133 A came and no prompt text yet: the next text sets the anchor.
+    prompt_anchor_pending: bool,
+    /// The screen changed size while the shell was at this prompt. The shell
+    /// redraws the prompt, and it can start that redraw on the wrong row when
+    /// it handled an older size than the one the terminal has now.
+    prompt_resized: bool,
+    /// An erase to the end of the display below the prompt's first row came
+    /// after such a resize: (row of the erase, semantic type before it). The
+    /// shell may be redrawing its prompt from a row that is too low. Its
+    /// prompt mark (OSC 133 P) confirms that, and then the rows between the
+    /// first row and the erase go away. A cursor-up cancels it (a completion
+    /// list below the input line also starts with such an erase).
+    prompt_redraw_erase: Option<(StableRowIndex, SemanticType)>,
+    /// readline (bash, and every program that uses it) has no prompt marks.
+    /// After SIGWINCH it sends CR and erase-to-end-of-line, goes up through
+    /// the rows above (cursor-up, and in bash 5.2 an erase of each row), and
+    /// then sends its whole line. The number of rows is the row count of the
+    /// line before the resize: readline does not expect the terminal to
+    /// rewrap, and the count can be for an older size. 0: idle. 1: a resize came while a line editor was active.
+    /// 2: CR seen. 3: the line was erased from its real first row; the
+    /// cursor-up moves that follow must not move.
+    editor_redraw: u8,
+    /// The row where the line editor started: the cursor row when the
+    /// program turned bracketed paste on (bash does that right before it
+    /// prints its prompt). A redraw never goes above it.
+    editor_anchor: Option<StableRowIndex>,
+    /// Cursor-up moves of the redraw that are done already: the rows from
+    /// the bottom row of the line to its first row.
+    editor_ups_done: usize,
+    /// A burst of resizes gives several redraws, the later ones without a
+    /// resize before them. Keep watching until this time.
+    redraw_watch_until: Option<std::time::Instant>,
+    /// A tmux control-mode mirror displays tmux's mode screen (copy mode,
+    /// choosers) via private mode 9727. Its cursor state is kept apart from
+    /// DECSC so that the application's saved cursor survives the mode.
+    /// The bool records whether the primary screen was replaced by the alt
+    /// screen for the duration of the mode.
+    tmux_mode_saved: Option<(SavedCursor, bool)>,
+    /// Private mode 9728 brackets an exact tmux redraw of the primary
+    /// screen. imgcat images exist only here (tmux passes them through), so
+    /// their pieces are kept and reattached to rows that stay blank. The
+    /// bool records whether the scrollback was also scanned.
+    tmux_redraw_images: Option<(Vec<(usize, usize, Vec<wezterm_cell::image::ImageCell>)>, bool)>,
     /// The current set of attributes in effect for the next
     /// attempt to print to the display
     pen: CellAttributes,
@@ -360,6 +429,8 @@ pub struct TerminalState {
     clipboard: Option<Arc<dyn Clipboard>>,
     device_control_handler: Option<Box<dyn DeviceControlHandler>>,
     alert_handler: Option<Box<dyn AlertHandler>>,
+    /// OSC 7377 audio streams (see crate::audio).
+    audio: crate::audio::AudioStreams,
     download_handler: Option<Arc<dyn DownloadHandler>>,
 
     current_dir: Option<Url>,
@@ -373,8 +444,10 @@ pub struct TerminalState {
     sixel_scrolls_right: bool,
 
     user_vars: HashMap<String, String>,
+    program_status: wezterm_program_status::Status,
 
     kitty_img: KittyImageState,
+    pub(crate) image_files_allowed: bool,
     seqno: SequenceNo,
 
     /// The unicode version that is in effect
@@ -459,6 +532,7 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// input from the interactive user, or pastes.
 struct ThreadedWriter {
     sender: Sender<WriterMessage>,
+    suppressed: bool,
 }
 
 enum WriterMessage {
@@ -487,12 +561,18 @@ impl ThreadedWriter {
             }
         });
 
-        Self { sender }
+        Self {
+            sender,
+            suppressed: false,
+        }
     }
 }
 
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.suppressed {
+            return Ok(buf.len());
+        }
         self.sender
             .send(WriterMessage::Data(buf.to_vec()))
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
@@ -508,6 +588,30 @@ impl std::io::Write for ThreadedWriter {
 }
 
 impl TerminalState {
+    fn publish_status_var(&mut self, name: String, value: String) {
+        if self.user_vars.get(&name) == Some(&value) { return; }
+        self.user_vars.insert(name.clone(), value.clone());
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::SetUserVar { name, value });
+        }
+    }
+
+    pub fn program_status_process_exited(&mut self) {
+        self.program_status.prompt_or_exit();
+        self.publish_program_status();
+    }
+
+    fn publish_program_status(&mut self) {
+        self.publish_status_var("WEZTERM_PROGRAM_STATUS".to_owned(), self.program_status.json());
+    }
+
+    pub(crate) fn suppress_output_responses(&mut self, suppressed: bool) {
+        // Flush while the previous policy is still active: user input buffered
+        // before rendering must survive, while buffered mirror replies must not.
+        self.writer.flush().ok();
+        self.writer.get_mut().suppressed = suppressed;
+    }
+
     /// Constructs the terminal state.
     /// You generally want the `Terminal` struct rather than this one;
     /// Terminal contains and dereferences to `TerminalState`.
@@ -529,6 +633,17 @@ impl TerminalState {
         TerminalState {
             config,
             screen,
+            resize_preview: None,
+            prompt_anchor: None,
+            prompt_anchor_pending: false,
+            prompt_resized: false,
+            prompt_redraw_erase: None,
+            editor_redraw: 0,
+            editor_anchor: None,
+            editor_ups_done: 0,
+            redraw_watch_until: None,
+            tmux_mode_saved: None,
+            tmux_redraw_images: None,
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
             top_and_bottom_margins: 0..size.rows as VisibleRowIndex,
@@ -575,6 +690,7 @@ impl TerminalState {
             clipboard: None,
             device_control_handler: None,
             alert_handler: None,
+            audio: Default::default(),
             download_handler: None,
             current_dir: None,
             term_program: term_program.to_string(),
@@ -582,7 +698,9 @@ impl TerminalState {
             writer,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
+            program_status: Default::default(),
             kitty_img: Default::default(),
+            image_files_allowed: true,
             seqno,
             unicode_version,
             unicode_version_stack: vec![],
@@ -716,6 +834,18 @@ impl TerminalState {
     /// the alternate screen).
     pub fn screen_mut(&mut self) -> &mut Screen {
         &mut self.screen
+    }
+
+    /// The primary screen and its scrollback, even while the alternate
+    /// screen is active.
+    pub fn primary_screen(&self) -> &Screen {
+        &self.screen.screen
+    }
+
+    /// True while a tmux mirror shows a mode screen in place of the primary
+    /// screen (private mode 9727 replaced the primary screen).
+    pub fn tmux_mode_replaces_primary(&self) -> bool {
+        matches!(self.tmux_mode_saved, Some((_, true)))
     }
 
     fn set_clipboard_contents(
@@ -969,8 +1099,67 @@ impl TerminalState {
     /// specified dimensions.
     /// We need to resize both the primary and alt screens, adjusting
     /// the cursor positions of both accordingly.
+    pub fn cancel_resize_preview(&mut self) {
+        if let Some(p) = self.resize_preview.take() {
+            self.screen = p.screen;
+            self.cursor = p.cursor;
+            self.wrap_next = p.wrap_next;
+            self.pixel_width = p.size.pixel_width;
+            self.pixel_height = p.size.pixel_height;
+            self.dpi = p.size.dpi;
+            self.top_and_bottom_margins = p.rows;
+            self.left_and_right_margins = p.cols;
+            self.tabs = p.tabs;
+            self.prompt_anchor = p.prompt_anchor;
+            self.prompt_resized = p.prompt_resized;
+            self.editor_redraw = p.editor_redraw;
+            self.editor_anchor = p.editor_anchor;
+        }
+    }
+
+    /// Project an immediate GUI resize without changing the authoritative
+    /// parser state. Output must first cancel this projection, then apply
+    /// ordered server resize events before interpreting subsequent bytes.
+    pub fn preview_resize(&mut self, size: TerminalSize) {
+        self.cancel_resize_preview();
+        if self.get_size() == size { return; }
+        let saved = ResizePreview { screen: self.screen.clone(), cursor: self.cursor,
+            wrap_next: self.wrap_next, size: self.get_size(), rows: self.top_and_bottom_margins.clone(),
+            cols: self.left_and_right_margins.clone(), tabs: self.tabs.clone(),
+            prompt_anchor: self.prompt_anchor, prompt_resized: self.prompt_resized,
+            editor_redraw: self.editor_redraw, editor_anchor: self.editor_anchor };
+        self.resize(size);
+        self.resize_preview = Some(saved);
+    }
+
     pub fn resize(&mut self, size: TerminalSize) {
         self.increment_seqno();
+        // Follow the prompt's first row through the rewrap of the primary
+        // screen. The shell redraws its prompt after the resize.
+        let at_prompt = self.pen.semantic_type() != SemanticType::Output;
+        let mut anchor = self.prompt_anchor.take().filter(|_| at_prompt);
+        if anchor.is_none() && !self.prompt_anchor_pending {
+            // A terminal restored from a snapshot (Rex attach) has the cells
+            // of the prompt but none of its marks: take the prompt from them.
+            anchor = self.prompt_anchor_from_cells();
+        }
+        let editor_anchor = self.editor_anchor.take();
+        self.screen.screen.tracked_rows = [
+            anchor.and_then(|row| self.screen.screen.stable_row_to_phys(row)),
+            editor_anchor.and_then(|row| self.screen.screen.stable_row_to_phys(row)),
+        ];
+        // Bracketed paste is on while a line editor reads a line (readline,
+        // zle, prompt_toolkit) and off while a command runs. Watch for the
+        // editor's redraw of its line (see `editor_redraw_step`). A tmux
+        // mirror shows tmux's own screen instead.
+        if self.bracketed_paste
+            && !self.screen.is_alt_screen_active()
+            && !self.screen.screen.keep_rows_below_cursor
+        {
+            self.editor_redraw = 1;
+            self.redraw_watch_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        }
         let (cursor_main, cursor_alt) = if self.screen.alt_screen_is_active {
             (
                 self.screen
@@ -1031,6 +1220,290 @@ impl TerminalState {
                 saved.wrap_next = false;
             }
         }
+        let [prompt_row, editor_row] = std::mem::take(&mut self.screen.screen.tracked_rows);
+        self.editor_anchor = editor_row.map(|row| self.screen.screen.phys_to_stable_row_index(row));
+        if let Some(row) = prompt_row {
+            self.prompt_anchor = Some(self.screen.screen.phys_to_stable_row_index(row));
+            self.prompt_resized = true;
+            self.redraw_watch_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        }
+    }
+
+    /// OSC 133 A: a new prompt starts. Its first row is the row of its
+    /// first text (see `prompt_text`).
+    pub(crate) fn prompt_marked(&mut self) {
+        self.publish_at_prompt(true);
+        if self.screen.is_alt_screen_active() {
+            return;
+        }
+        self.prompt_anchor = None;
+        self.prompt_anchor_pending = true;
+        self.prompt_redraw_erase = None;
+        self.prompt_resized = false;
+    }
+
+    /// Text is printed. The first text after OSC 133 A is the first row of
+    /// the prompt. Text after a possible redraw erase is part of the redraw.
+    pub(crate) fn prompt_text(&mut self) {
+        if std::mem::take(&mut self.prompt_anchor_pending) && !self.screen.is_alt_screen_active() {
+            self.prompt_anchor = Some(self.screen().visible_row_to_stable_row(self.cursor.y));
+        }
+    }
+
+    /// OSC 133 P (k=i): the shell's prompt mark. zsh puts it at the start of
+    /// PS1, or later in PS1 (after a first line that a theme prints). After a
+    /// resize the shell redraws its prompt from the row where it believes the
+    /// prompt starts. That row is too low when the shell handled an older,
+    /// wider size than the terminal has now: the redraw then confirms here,
+    /// and the rows between the real first row and the redraw go away.
+    pub(crate) fn prompt_started(&mut self) {
+        self.publish_at_prompt(true);
+        if self.screen.is_alt_screen_active() {
+            return;
+        }
+        // A shell without OSC 133 A: the mark is the first row.
+        if std::mem::take(&mut self.prompt_anchor_pending) || self.prompt_anchor.is_none() {
+            self.prompt_anchor = Some(self.screen().visible_row_to_stable_row(self.cursor.y));
+        }
+        if let (Some((erase_row, _)), Some(anchor)) = (self.prompt_redraw_erase.take(), self.prompt_anchor) {
+            let top = self.screen().visible_row_to_stable_row(0);
+            let rows = (erase_row - anchor) as usize;
+            if erase_row > anchor && anchor >= top {
+                let (x, y) = (self.cursor.x, self.cursor.y);
+                self.cursor.y = (anchor - top) as VisibleRowIndex;
+                self.perform_csi_edit(Edit::DeleteLine(rows as u32));
+                self.cursor.x = x;
+                self.cursor.y = y - rows as VisibleRowIndex;
+                self.cursor.seqno = self.seqno;
+                self.wrap_next = false;
+            }
+        }
+        // A burst of resizes gives several redraws: keep watching a while.
+        self.prompt_resized = self.prompt_resized
+            && self
+                .redraw_watch_until
+                .is_some_and(|until| std::time::Instant::now() < until);
+    }
+
+    /// WEZTERM_AT_PROMPT is "1" from OSC 133 A/P (the shell shows its
+    /// prompt) to OSC 133 C (a command runs). A tab bar can name the shell,
+    /// not a helper that a prompt hook starts (git, pgrep), and key bindings
+    /// can tell a remote prompt from a remote program over SSH.
+    fn publish_at_prompt(&mut self, at_prompt: bool) {
+        self.publish_status_var("WEZTERM_AT_PROMPT".to_owned(), if at_prompt { "1" } else { "" }.to_owned());
+    }
+
+    pub(crate) fn prompt_finished(&mut self) {
+        self.publish_at_prompt(false);
+        self.prompt_anchor = None;
+        self.prompt_anchor_pending = false;
+        self.prompt_resized = false;
+        self.prompt_redraw_erase = None;
+    }
+
+    /// The first row of the prompt that holds the cursor, from the semantic
+    /// types of the cells: the rows above the cursor that have prompt or
+    /// input text. The cursor row must hold some. When found, the pen takes
+    /// the type of the cell before the cursor (the shell is at its prompt).
+    fn prompt_anchor_from_cells(&mut self) -> Option<StableRowIndex> {
+        if self.screen.is_alt_screen_active() {
+            return None;
+        }
+        let cursor = self.cursor;
+        let screen = self.screen();
+        let marked = |y: VisibleRowIndex| -> Option<SemanticType> {
+            let line = screen.lines_in_phys_range(screen.phys_row(y)..screen.phys_row(y) + 1).pop()?;
+            let mut found = None;
+            for cell in line.visible_cells() {
+                let kind = cell.attrs().semantic_type();
+                if kind == SemanticType::Output {
+                    if !cell.str().trim().is_empty() {
+                        return None;
+                    }
+                } else if !cell.str().trim().is_empty() || found.is_none() {
+                    found = Some(kind);
+                }
+            }
+            found
+        };
+        marked(cursor.y)?;
+        let mut top = cursor.y;
+        while top > 0 && marked(top - 1).is_some() {
+            top -= 1;
+        }
+        // Blank rows at the top (an empty line after OSC 133 A) are not the
+        // prompt's first row.
+        while top < cursor.y {
+            let line = screen.lines_in_phys_range(screen.phys_row(top)..screen.phys_row(top) + 1).pop();
+            if line.is_some_and(|l| !l.as_str().trim().is_empty()) {
+                break;
+            }
+            top += 1;
+        }
+        let anchor = screen.visible_row_to_stable_row(top);
+        let line = screen.lines_in_phys_range(screen.phys_row(cursor.y)..screen.phys_row(cursor.y) + 1).pop();
+        let before = line.and_then(|l| l.get_cell(cursor.x.saturating_sub(1)).map(|c| c.attrs().semantic_type()));
+        self.pen.set_semantic_type(before.filter(|k| *k != SemanticType::Output).unwrap_or(SemanticType::Input));
+        Some(anchor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_prompt_state(&mut self) {
+        self.prompt_anchor = None;
+        self.prompt_anchor_pending = false;
+        self.prompt_resized = false;
+        self.pen.set_semantic_type(SemanticType::Output);
+    }
+
+    /// The cursor went up: a pending redraw erase was not a prompt redraw.
+    pub(crate) fn prompt_cursor_up(&mut self) {
+        if let Some((_, semantic)) = self.prompt_redraw_erase.take() {
+            self.pen.set_semantic_type(semantic);
+        }
+    }
+
+    /// Put the cursor on the first row of the prompt. On a very narrow
+    /// screen that row can be in the scrollback: those rows of the old prompt
+    /// go away and the cursor goes to the top row.
+    /// Returns false when the anchor is not a row that this can reach.
+    fn move_to_prompt_anchor(&mut self, anchor: StableRowIndex) -> bool {
+        let mut top = self.screen().visible_row_to_stable_row(0);
+        let rows = self.screen().physical_rows as StableRowIndex;
+        if anchor >= top + rows || top - anchor > MAX_PROMPT_ROWS_IN_SCROLLBACK {
+            return false;
+        }
+        let mut anchor = anchor;
+        if anchor < top {
+            let screen = self.screen_mut();
+            let Some(first) = screen.stable_row_to_phys(anchor) else {
+                return false;
+            };
+            let visible = screen.phys_row(0);
+            screen.remove_scrollback_rows(first..visible);
+            top = screen.visible_row_to_stable_row(0);
+            anchor = top;
+        }
+        let seqno = self.seqno;
+        self.cursor.y = (anchor - top) as VisibleRowIndex;
+        self.cursor.x = self.left_and_right_margins.start;
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+        // The row above no longer continues into the redrawn prompt.
+        if anchor > top {
+            let screen = self.screen_mut();
+            let above = screen.phys_row((anchor - top) as VisibleRowIndex - 1);
+            let line = screen.line_mut(above);
+            if line.last_cell_was_wrapped() {
+                line.set_last_cell_was_wrapped(false, seqno);
+            }
+        }
+        true
+    }
+
+    /// Erase the logical line that holds the cursor (every row that wraps
+    /// into the cursor's row) and put the cursor on its first cell.
+    pub(crate) fn erase_editor_line(&mut self) {
+        let seqno = self.seqno;
+        let pen = self.pen.clone_sgr_only();
+        let bidi_mode = self.get_bidi_mode();
+        let bottom = self.cursor.y;
+        let screen = self.screen_mut();
+        let cols = screen.physical_cols;
+        let visible = screen.phys_row(0);
+        let mut first = screen.phys_row(bottom);
+        while first > 0 && screen.line_mut(first - 1).last_cell_was_wrapped() {
+            first -= 1;
+        }
+        // On a very narrow screen the line is taller than the screen: its
+        // first rows are in the scrollback. They go away with the line.
+        let top = if first < visible {
+            if visible - first <= MAX_PROMPT_ROWS_IN_SCROLLBACK as usize {
+                screen.remove_scrollback_rows(first..visible);
+            }
+            0
+        } else {
+            (first - visible) as VisibleRowIndex
+        };
+        for y in top..=bottom {
+            screen.clear_line(y, 0..cols, &pen, seqno, bidi_mode);
+        }
+        self.editor_ups_done = (bottom - top) as usize;
+        self.cursor.y = top;
+        self.cursor.x = self.left_and_right_margins.start;
+        self.cursor.seqno = seqno;
+        self.wrap_next = false;
+    }
+
+    /// readline goes up `count` rows from the bottom row of its line. The
+    /// cursor went up to the first row of the wrapped line already. readline
+    /// can count more rows (it broke the line itself, with a newline): go up
+    /// for those, but never above the row where the editor started.
+    pub(crate) fn editor_cursor_up(&mut self, count: usize) {
+        let done = count.min(self.editor_ups_done);
+        self.editor_ups_done -= done;
+        let more = (count - done) as VisibleRowIndex;
+        if more == 0 {
+            return;
+        }
+        let top = self.screen().visible_row_to_stable_row(0);
+        let floor = match self.editor_anchor {
+            Some(anchor) => (anchor - top).max(0) as VisibleRowIndex,
+            None => return,
+        };
+        if self.cursor.y > floor {
+            self.cursor.y = (self.cursor.y - more).max(floor);
+            self.cursor.seqno = self.seqno;
+            self.wrap_next = false;
+        }
+    }
+
+    /// An erase to the end of the display, from the application.
+    fn erase_to_end_of_display_from_app(&mut self) {
+        let semantic = self.pen.semantic_type();
+        let at_prompt = semantic != SemanticType::Output;
+        if at_prompt && self.cursor.x == 0 && !self.screen.is_alt_screen_active() {
+            if let Some(anchor) = self.prompt_anchor {
+                let row = self.screen().visible_row_to_stable_row(self.cursor.y);
+                if self.prompt_resized && row < anchor {
+                    // The shell went above its prompt: keep the output there.
+                    self.move_to_prompt_anchor(anchor);
+                } else if self.prompt_resized && row > anchor {
+                    self.prompt_redraw_erase = Some((row, semantic));
+                    self.pen.set_semantic_type(SemanticType::Prompt);
+                }
+                let row = self.screen().visible_row_to_stable_row(self.cursor.y);
+                if row == anchor {
+                    // A redraw of the whole prompt (after a resize, or zsh's
+                    // reset-prompt). The text before the prompt mark is
+                    // prompt text, not the input of the last draw.
+                    self.pen.set_semantic_type(SemanticType::Prompt);
+                }
+            }
+        }
+        // A row that is erased from its first column no longer continues
+        // the row above it.
+        if self.cursor.x == 0 && self.cursor.y > 0 && !self.screen.is_alt_screen_active() {
+            let seqno = self.seqno;
+            let y = self.cursor.y - 1;
+            let screen = self.screen_mut();
+            let above = screen.phys_row(y);
+            let line = screen.line_mut(above);
+            if line.last_cell_was_wrapped() {
+                line.set_last_cell_was_wrapped(false, seqno);
+            }
+        }
+        self.erase_in_display(EraseInDisplay::EraseToEndOfDisplay);
+    }
+
+    /// Resize as tmux does (see Screen::keep_rows_below_cursor): a tmux -CC
+    /// mirror previews a pane resize before tmux sends the real screen.
+    pub fn resize_like_tmux(&mut self, size: TerminalSize) {
+        self.screen.screen.keep_rows_below_cursor = true;
+        self.screen.alt_screen.keep_rows_below_cursor = true;
+        self.resize(size);
+        self.screen.screen.keep_rows_below_cursor = false;
+        self.screen.alt_screen.keep_rows_below_cursor = false;
     }
 
     pub fn get_size(&self) -> TerminalSize {
@@ -1782,9 +2255,14 @@ impl TerminalState {
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::BracketedPaste)) => {
                 self.bracketed_paste = true;
+                if !self.screen.is_alt_screen_active() {
+                    self.editor_anchor =
+                        Some(self.screen().visible_row_to_stable_row(self.cursor.y));
+                }
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::BracketedPaste)) => {
                 self.bracketed_paste = false;
+                self.editor_anchor = None;
             }
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::BracketedPaste)) => {
                 self.decqrm_response(mode, true, self.bracketed_paste);
@@ -2052,6 +2530,62 @@ impl TerminalState {
                 DecPrivateModeCode::XTermAltSendsEscape,
             )) => {}
 
+            Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(9727)) => {
+                if self.tmux_mode_saved.is_none() {
+                    let saved = SavedCursor {
+                        position: self.cursor,
+                        wrap_next: self.wrap_next,
+                        pen: self.pen.clone(),
+                        dec_origin_mode: self.dec_origin_mode,
+                        g0_charset: self.g0_charset,
+                        g1_charset: self.g1_charset,
+                    };
+                    let switched = !self.screen.is_alt_screen_active();
+                    if switched {
+                        self.screen.activate_alt_screen(self.seqno);
+                        self.pen = CellAttributes::default();
+                        self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
+                        self.erase_in_display(EraseInDisplay::EraseDisplay);
+                    }
+                    self.tmux_mode_saved = Some((saved, switched));
+                }
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(9727)) => {
+                if let Some((saved, switched)) = self.tmux_mode_saved.take() {
+                    if switched && self.screen.is_alt_screen_active() {
+                        self.screen.activate_primary_screen(self.seqno);
+                    }
+                    self.dec_origin_mode = false;
+                    self.set_cursor_pos(
+                        &Position::Absolute(saved.position.x as i64),
+                        &Position::Absolute(saved.position.y),
+                    );
+                    self.cursor.shape = saved.position.shape;
+                    self.wrap_next = saved.wrap_next;
+                    self.pen = saved.pen;
+                    self.dec_origin_mode = saved.dec_origin_mode;
+                    self.g0_charset = saved.g0_charset;
+                    self.g1_charset = saved.g1_charset;
+                }
+            }
+            Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(9728)) => {
+                if !self.screen.is_alt_screen_active() {
+                    let screen = self.screen();
+                    let visible = screen.phys_row(0)..screen.scrollback_rows();
+                    let cells = screen.image_cells_in_phys_range(visible);
+                    self.tmux_redraw_images = Some((cells, false));
+                } else {
+                    self.tmux_redraw_images = None;
+                }
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(9728)) => {
+                if let Some((cells, _)) = self.tmux_redraw_images.take() {
+                    if !cells.is_empty() && !self.screen.is_alt_screen_active() {
+                        let seqno = self.seqno;
+                        self.screen_mut().restore_image_cells(cells, seqno);
+                    }
+                }
+            }
             Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(_))
             | Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(_))
             | Mode::SaveDecPrivateMode(DecPrivateMode::Unspecified(_))
@@ -2241,6 +2775,16 @@ impl TerminalState {
             }
             EraseInDisplay::EraseDisplay => 0..rows,
             EraseInDisplay::EraseScrollback => {
+                // A history redraw inside mode 9728 keeps scrollback images.
+                if !self.screen.is_alt_screen_active() {
+                    if let Some((cells, scanned)) = self.tmux_redraw_images.as_mut() {
+                        if !*scanned {
+                            *scanned = true;
+                            let history = 0..self.screen.phys_row(0);
+                            cells.extend(self.screen.image_cells_in_phys_range(history));
+                        }
+                    }
+                }
                 self.screen_mut().erase_scrollback();
                 return;
             }
@@ -2377,6 +2921,9 @@ impl TerminalState {
             }
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
             Edit::ScrollUp(n) => self.scroll_up(n as usize),
+            Edit::EraseInDisplay(EraseInDisplay::EraseToEndOfDisplay) => {
+                self.erase_to_end_of_display_from_app()
+            }
             Edit::EraseInDisplay(erase) => self.erase_in_display(erase),
             Edit::Repeat(n) => {
                 let mut y = self.cursor.y;
@@ -2540,6 +3087,7 @@ impl TerminalState {
 
             Cursor::Up(n) => {
                 // https://vt100.net/docs/vt510-rm/CUU.html
+                self.prompt_cursor_up();
 
                 let candidate = self.cursor.y.saturating_sub(i64::from(n));
                 let new_y = if self.cursor.y < self.top_and_bottom_margins.start {

@@ -69,6 +69,7 @@ use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
+pub mod agent_panel;
 pub mod background;
 pub mod box_model;
 pub mod charselect;
@@ -77,12 +78,15 @@ pub mod keyevent;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
+pub mod popup_menu;
+mod command_prompt;
 pub mod paneselect;
 mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod tmux_windows;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
@@ -108,6 +112,19 @@ pub fn get_window_class() -> String {
     WINDOW_CLASS.lock().unwrap().clone()
 }
 
+/// See TermWindow::popup_frame_mouse_event.
+#[derive(Debug, Clone, Copy)]
+pub struct PopupDrag {
+    pub tab_id: mux::tab::TabId,
+    pub pane_id: mux::pane::PaneId,
+    pub start_x: f64,
+    pub start_y: f64,
+    pub left: usize,
+    pub top: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MouseCapture {
     UI,
@@ -124,6 +141,8 @@ pub enum TermWindowNotif {
         tx: Option<Sender<anyhow::Result<()>>>,
     },
     SetLeftStatus(String),
+    SetStatusMessage(String),
+    SetTabBarRule(bool),
     SetRightStatus(String),
     GetDimensions(Sender<(Dimensions, WindowState)>),
     GetSelectionForPane {
@@ -191,8 +210,25 @@ pub struct OverlayState {
     pub key_table_state: KeyTableState,
 }
 
+impl OverlayState {
+    fn use_selector_keys(&mut self) {
+        self.key_table_state.activate(KeyTableArgs {
+            name: "selector_mode",
+            timeout_milliseconds: None,
+            replace_current: false,
+            one_shot: false,
+            until_unknown: false,
+            prevent_fallback: false,
+            passthrough: false,
+        });
+    }
+}
+
 #[derive(Default)]
 pub struct PaneState {
+    marked: bool,
+    copy_scroll: Option<render::copyscroll::CopyScroll>,
+    selection_style: Option<(Instant,config::keyassignment::SelectionStyle)>,
     /// If is_some(), the top row of the visible screen.
     /// Otherwise, the viewport is at the bottom of the
     /// scrollback.
@@ -397,6 +433,9 @@ pub struct TermWindow {
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
+    pub status_message: String,
+    pub tab_bar_rule: bool,
+    last_painted_tab_count: usize,
     last_ui_item: Option<UIItem>,
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
@@ -409,6 +448,7 @@ pub struct TermWindow {
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
+    title_update_pending: bool,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
@@ -416,6 +456,16 @@ pub struct TermWindow {
     current_modifier_and_leds: (Modifiers, KeyboardLedStatus),
     current_mouse_buttons: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
+    /// A tmux popup being dragged by its GUI-drawn frame.
+    popup_drag: Option<PopupDrag>,
+    /// tmux window previews (tmux_windows.rs).
+    pub strip_hover: Option<tmux_windows::StripHover>,
+    /// The agent shells of a tab (agent_panel.rs).
+    pub agent_panel: Option<agent_panel::AgentPanel>,
+    /// A native selection drag held past the top or bottom of its pane.
+    pub selection_autoscroll: Option<selection::SelectionAutoScroll>,
+    pub window_overview: Option<tmux_windows::WindowOverview>,
+    pub split_drag: Option<tmux_windows::SplitDrag>,
 
     opengl_info: Option<String>,
 
@@ -448,8 +498,13 @@ pub struct TermWindow {
     modal: RefCell<Option<Rc<dyn Modal>>>,
 
     event_states: HashMap<String, EventState>,
+    lua_key_actions: std::collections::HashSet<String>,
+    deferred_keys: std::collections::VecDeque<WindowEvent>,
     pub current_event: Option<Value>,
     has_animation: RefCell<Option<Instant>>,
+    /// An agent status indicator moves on screen: it keeps moving while
+    /// the window has no focus (other animations stop then).
+    status_animation: std::cell::Cell<bool>,
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
@@ -470,6 +525,13 @@ pub struct TermWindow {
 }
 
 impl TermWindow {
+    pub(crate) fn set_marked_pane(&mut self, id: Option<PaneId>) {
+        for state in self.pane_state.borrow_mut().values_mut() {state.marked=false;}
+        if let Some(id)=id {self.pane_state(id).marked=true;}
+        self.quad_generation+=1;
+        if let Some(w)=self.window.as_ref(){w.invalidate();}
+    }
+
     fn load_os_parameters(&mut self) {
         if let Some(ref window) = self.window {
             self.os_parameters = match window.get_os_parameters(&self.config, self.window_state) {
@@ -719,6 +781,9 @@ impl TermWindow {
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
+            status_message: String::new(),
+            tab_bar_rule: false,
+            last_painted_tab_count: 0,
             last_mouse_coords: (0, -1),
             window_drag_position: None,
             current_mouse_event: None,
@@ -727,8 +792,15 @@ impl TermWindow {
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
+            title_update_pending: false,
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
+            popup_drag: None,
+            strip_hover: None,
+            agent_panel: None,
+            selection_autoscroll: None,
+            window_overview: None,
+            split_drag: None,
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,
@@ -781,8 +853,11 @@ impl TermWindow {
                 None,
             )),
             event_states: HashMap::new(),
+            lua_key_actions: Default::default(),
+            deferred_keys: Default::default(),
             current_event: None,
             has_animation: RefCell::new(None),
+            status_animation: std::cell::Cell::new(false),
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
@@ -983,10 +1058,18 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::RawKeyEvent(event) => {
+                if !self.lua_key_actions.is_empty() {
+                    self.deferred_keys.push_back(WindowEvent::RawKeyEvent(event));
+                    return Ok(true);
+                }
                 self.raw_key_event_impl(event, window);
                 Ok(true)
             }
             WindowEvent::KeyEvent(event) => {
+                if !self.lua_key_actions.is_empty() {
+                    self.deferred_keys.push_back(WindowEvent::KeyEvent(event));
+                    return Ok(true);
+                }
                 self.key_event_impl(event, window);
                 Ok(true)
             }
@@ -1047,6 +1130,17 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
+                if pane.downcast_ref::<mux::rex::RexPane>().is_some() {
+                    promise::spawn::spawn(async move {
+                        if let Some(rex)=pane.downcast_ref::<mux::rex::RexPane>() {
+                            if let Err(error)=rex.call("wezterm.upload",serde_json::json!({"paths":paths})).await {
+                                log::error!("Rex file drop: {error:#}");
+                                Mux::get().notify(MuxNotification::Alert{pane_id:pane.pane_id(),alert:Alert::ToastNotification{title:Some("File upload failed".into()),body:error.to_string(),focus:false}});
+                            }
+                        }
+                    }).detach();
+                    return Ok(true);
+                }
                 let paths = paths
                     .iter()
                     .map(|path| {
@@ -1085,7 +1179,10 @@ impl TermWindow {
             ),
         );
         self.paint_impl(&mut RenderFrame::Glium(&mut frame));
-        window.finish_frame(frame).is_ok()
+        let present_started = Instant::now();
+        let result = window.finish_frame(frame).is_ok();
+        log::debug!(target: "tmux_scroll", "present_ms={:.1}", present_started.elapsed().as_secs_f32()*1000.);
+        result
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
@@ -1161,6 +1258,18 @@ impl TermWindow {
                     self.schedule_next_status_update();
                 }
             }
+            TermWindowNotif::SetStatusMessage(status) => {
+                if status != self.status_message {
+                    self.status_message=status;
+                    self.update_title_post_status();
+                }
+            }
+            TermWindowNotif::SetTabBarRule(enabled) => {
+                if self.tab_bar_rule != enabled {
+                    self.tab_bar_rule = enabled;
+                    window.invalidate();
+                }
+            }
             TermWindowNotif::SetLeftStatus(status) => {
                 if status != self.left_status {
                     self.left_status = status;
@@ -1200,6 +1309,12 @@ impl TermWindow {
                 self.cancel_overlay_for_tab(tab_id, pane_id);
             }
             TermWindowNotif::MuxNotification(n) => match n {
+                MuxNotification::Alert {
+                    alert: Alert::SetUserVar { name, .. },
+                    ..
+                } if name == mux::tmux_strip::OVERVIEW_USER_VAR => {
+                    self.open_window_overview();
+                }
                 MuxNotification::Alert {
                     alert: Alert::SetUserVar { name, value },
                     pane_id,
@@ -1329,11 +1444,13 @@ impl TermWindow {
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
                 let mux = Mux::get();
-                let pane = mux
+                // The pane may close after Lua queues this status query.
+                let selection = mux
                     .get_pane(pane_id)
-                    .ok_or_else(|| anyhow!("pane id {} is not valid", pane_id))?;
+                    .map(|pane| self.selection_text(&pane))
+                    .unwrap_or_default();
 
-                tx.try_send(self.selection_text(&pane))
+                tx.try_send(selection)
                     .map_err(chan_err)
                     .context("send GetSelectionForPane response")?;
             }
@@ -1437,6 +1554,14 @@ impl TermWindow {
         }
 
         if tab
+            .get_remote_chrome()
+            .map(|pos| pos.pane.pane_id() == pane_id)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        if tab
             .get_visible_floating_panes()
             .iter()
             .any(|pos| pos.pane.pane_id() == pane_id)
@@ -1449,7 +1574,20 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
-        if self.is_pane_visible(pane_id) {
+        // The hover preview and the window overview show other tabs' panes:
+        // they repaint with those panes' output too.
+        let overview = self.window_overview.is_some();
+        let hovered = self.strip_hover.map(|h| h.tab_id);
+        let previewed = || {
+            if !overview && hovered.is_none() {
+                return false;
+            }
+            let Some((_, _, tab_id)) = Mux::get().resolve_pane_id(pane_id) else {
+                return false;
+            };
+            overview || hovered == Some(tab_id)
+        };
+        if self.is_pane_visible(pane_id) || previewed() {
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
@@ -1648,6 +1786,26 @@ impl TermWindow {
         } else {
             *state = EventState::None;
         }
+        if matches!(self.event_states.get(name),Some(EventState::None)) {
+            self.lua_key_actions.remove(name);
+        }
+        // Replay raw and composed events together, retaining the shared handled
+        // flag so a physical binding cannot also type its composed character.
+        if let Some(window)=self.window.clone() {
+            while self.lua_key_actions.is_empty() {
+                let Some(event)=self.deferred_keys.pop_front() else {break};
+                match event {
+                    WindowEvent::RawKeyEvent(key)=>self.raw_key_event_impl(key,&window),
+                    WindowEvent::KeyEvent(key)=>{
+                        if !key.raw.as_ref().is_some_and(|r|r.handled.is_handled()) {
+                            self.key_event_impl(key,&window);
+                        }
+                    },
+                    _=>unreachable!(),
+                }
+            }
+        }
+
     }
 
     pub fn emit_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
@@ -1909,7 +2067,7 @@ impl TermWindow {
     /// to update the right-status.
     fn update_title(&mut self) {
         self.schedule_status_update();
-        self.update_title_impl();
+        self.update_title_post_status();
     }
 
     fn window_contains_pane(&mut self, pane_id: PaneId) -> bool {
@@ -1969,7 +2127,15 @@ impl TermWindow {
     /// Called by window:set_right_status after the status has
     /// been updated; let's update the bar
     pub fn update_title_post_status(&mut self) {
-        self.update_title_impl();
+        if self.title_update_pending {return;}
+        let Some(window)=self.window.as_ref() else {self.update_title_impl();return;};
+        // One session revision may add/resize/title dozens of tabs. Rebuild
+        // their chrome once after this notification batch, not N times per tab.
+        self.title_update_pending=true;
+        window.notify(TermWindowNotif::Apply(Box::new(|window| {
+            window.title_update_pending=false;
+            window.update_title_impl();
+        })));
     }
 
     fn update_title_impl(&mut self) {
@@ -2002,7 +2168,9 @@ impl TermWindow {
             None => false,
         };
 
-        let new_tab_bar = TabBarState::new(
+        let new_tab_bar = if !self.status_message.is_empty() {
+            TabBarState::message(self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,&self.status_message)
+        } else { TabBarState::new(
             self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
             if hovering_in_tab_bar {
                 Some(self.last_mouse_coords.0)
@@ -2015,7 +2183,7 @@ impl TermWindow {
             &self.config,
             &self.left_status,
             &self.right_status,
-        );
+        ) };
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
@@ -2068,7 +2236,14 @@ impl TermWindow {
             Some(title) => title,
             None => {
                 if let (Some(pos), Some(tab)) = (active_pane, active_tab) {
-                    if tabs_count == 1 {
+                    let is_tmux = mux
+                        .get_pane(pos.pane_id)
+                        .and_then(|p| mux.get_domain(p.domain_id()))
+                        .map(|d| d.downcast_ref::<mux::tmux::TmuxDomain>().is_some())
+                        .unwrap_or(false);
+                    if is_tmux {
+                        pos.title
+                    } else if tabs_count == 1 {
                         format!("{}{}", if pos.is_zoomed { "[Z] " } else { "" }, pos.title)
                     } else {
                         format!(
@@ -2311,17 +2486,26 @@ impl TermWindow {
             crate::overlay::selector::selector(term, args, gui_win, pane)
         });
         self.assign_overlay(tab.tab_id(), overlay);
+        if let Some(overlay) = self.tab_state(tab.tab_id()).overlay.as_mut() {
+            overlay.use_selector_keys();
+        }
         promise::spawn::spawn(future).detach();
     }
 
     fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
+        if args.bottom {
+            if let Some(pane)=self.get_active_pane_no_overlay() {
+                self.set_modal(Rc::new(command_prompt::CommandPrompt::new(args.clone(),pane.pane_id())));
+            }
+            return;
+        }
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
         };
 
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.get_active_pane_no_overlay() {
             Some(pane) => pane,
             None => return,
         };
@@ -2473,6 +2657,9 @@ impl TermWindow {
                         });
 
                     term_window.assign_overlay(tab_id, overlay);
+                    if let Some(overlay) = term_window.tab_state(tab_id).overlay.as_mut() {
+                        overlay.use_selector_keys();
+                    }
                     promise::spawn::spawn(future).detach();
                 }
             })));
@@ -2607,6 +2794,12 @@ impl TermWindow {
             }
         }
 
+        if matches!(assignment, KeyAssignment::CopyMode(config::keyassignment::CopyModeAssignment::Close))
+            && pane.is::<CopyOverlay>() {
+            self.cancel_overlay_for_pane(pane.pane_id());
+            return Ok(PerformAssignmentResult::Handled);
+        }
+
         match pane.perform_assignment(assignment) {
             PerformAssignmentResult::Unhandled => {}
             result => return Ok(result),
@@ -2631,12 +2824,14 @@ impl TermWindow {
                 one_shot,
                 until_unknown,
                 prevent_fallback,
+                passthrough,
             } => {
                 anyhow::ensure!(
                     self.input_map.has_table(name),
                     "ActivateKeyTable: no key_table named {}",
                     name
                 );
+                if *passthrough { self.leader_is_down=None; }
                 self.key_table_state.activate(KeyTableArgs {
                     name,
                     timeout_milliseconds: *timeout_milliseconds,
@@ -2644,6 +2839,7 @@ impl TermWindow {
                     one_shot: *one_shot,
                     until_unknown: *until_unknown,
                     prevent_fallback: *prevent_fallback,
+                    passthrough: *passthrough,
                 });
                 self.update_title();
             }
@@ -2657,7 +2853,10 @@ impl TermWindow {
             }
             Multiple(actions) => {
                 for a in actions {
-                    self.perform_key_assignment(pane, a)?;
+                    // An earlier action can create a copy/search overlay.
+                    let target=self.pane_state(pane.pane_id()).overlay.as_ref()
+                        .map(|o|o.pane.clone()).unwrap_or_else(||pane.clone());
+                    self.perform_key_assignment(&target, a)?;
                 }
             }
             SpawnTab(spawn_where) => {
@@ -2733,7 +2932,17 @@ impl TermWindow {
                 let window = self.window.clone().unwrap();
                 window.set_window_level(level.clone());
             }
+            SetSelectionStyle(style) => {
+                let until=Instant::now()+Duration::from_millis(style.duration_milliseconds.min(60_000));
+                self.pane_state(pane.pane_id()).selection_style=Some((until,style.clone()));
+                self.quad_generation+=1;
+                self.update_next_frame_time(Some(until));
+                self.window.as_ref().unwrap().invalidate();
+            }
             CopyTo(dest) => {
+                if self.is_click_copy_pane(pane.pane_id()) {
+                    self.snap_click_copy_selection(pane);
+                }
                 let text = self.selection_text(pane);
                 self.copy_to_clipboard(*dest, text);
             }
@@ -2859,7 +3068,10 @@ impl TermWindow {
                 self.do_open_link_at_mouse_cursor(pane);
             }
             EmitEvent(name) => {
-                self.emit_window_event(name, None);
+                if self.config.serialize_lua_key_actions && self.get_active_pane_or_overlay().is_some() {
+                    self.lua_key_actions.insert(name.clone());
+                }
+                self.emit_window_event(name, Some(pane.pane_id()));
             }
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
                 let text = self.selection_text(pane);
@@ -2917,6 +3129,7 @@ impl TermWindow {
                                 one_shot: false,
                                 until_unknown: false,
                                 prevent_fallback: false,
+                                passthrough: false,
                             });
                         });
                 }
@@ -2967,6 +3180,7 @@ impl TermWindow {
                                 one_shot: false,
                                 until_unknown: false,
                                 prevent_fallback: false,
+                                passthrough: false,
                             });
                         });
                 }
@@ -3224,6 +3438,16 @@ impl TermWindow {
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
+            PopupMenu(args) => {
+                if let Some(pane) = self.get_active_pane_no_overlay() {
+                    self.set_modal(Rc::new(popup_menu::PopupMenu::new(args.clone(), pane.pane_id())));
+                }
+            }
+            AgentPanel(args) => {
+                if let Some(pane) = self.get_active_pane_no_overlay() {
+                    self.show_agent_panel(args, pane.pane_id());
+                }
+            }
             Confirmation(args) => self.show_confirmation(args),
             MoveFloatingPaneToHorizontalSplit => {
                 self.move_floating_pane_to_split(SplitDirection::Horizontal);
@@ -3549,7 +3773,11 @@ impl TermWindow {
             height: pos.height,
             pixel_width: pos.pixel_width,
             pixel_height: pos.pixel_height,
-            title: pos.pane.get_title(),
+            // tmux popup titles carry #[...] style runs for their frame.
+            title: match pos.pane.popup_frame() {
+                Some(_) => crate::termwindow::render::popup_frame::plain_title(&pos.pane.get_title()),
+                None => pos.pane.get_title(),
+            },
             user_vars: pos.pane.copy_user_vars(),
             progress: pos.pane.get_progress(),
         }
@@ -3591,6 +3819,7 @@ impl TermWindow {
     fn get_pane_information(&self) -> Vec<PaneInformation> {
         self.get_panes_to_render()
             .iter()
+            .chain(self.get_floating_panes_to_render().iter())
             .map(Self::pos_pane_to_pane_info)
             .collect()
     }
@@ -3728,10 +3957,15 @@ impl TermWindow {
 
     pub fn assign_overlay_for_pane(&mut self, pane_id: PaneId, pane: Arc<dyn Pane>) {
         self.cancel_overlay_for_pane(pane_id);
-        self.pane_state(pane_id).overlay.replace(OverlayState {
+        let is_selector = pane.downcast_ref::<QuickSelectOverlay>().is_some();
+        let mut overlay = OverlayState {
             pane,
             key_table_state: KeyTableState::default(),
-        });
+        };
+        if is_selector {
+            overlay.use_selector_keys();
+        }
+        self.pane_state(pane_id).overlay.replace(overlay);
         self.update_title();
     }
 

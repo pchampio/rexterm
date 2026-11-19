@@ -5,8 +5,17 @@ use super::*;
 mod c0;
 use bitflags::bitflags;
 mod c1;
+mod commands;
 mod csi;
 mod image;
+mod mirror;
+mod program_status;
+mod prompt_resize;
+mod resize_storm;
+mod resize_storm_traces;
+mod ssh_lag;
+mod user_zsh;
+mod user_zsh_trace;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
 use k9::assert_equal as assert_eq;
@@ -1376,5 +1385,30 @@ fn test_hyperlinks() {
             partial_line,
         ],
         Compare::TEXT | Compare::ATTRS,
+    );
+}
+
+/// A tmux -CC mirror previews a narrower pane like tmux: the cursor keeps its
+/// row, and the extra rows of rewrapped lines go up into the scrollback.
+#[test]
+fn test_resize_like_tmux_keeps_cursor_row() {
+    let mut term = TestTerm::new(8, 20, 100);
+    term.print("aaaaaaaaaaaaaaa\r\nbbbbbbbbbbbbbbb\r\n\r\n$ ");
+    term.assert_cursor_pos(2, 3, None, None);
+    term.resize_like_tmux(TerminalSize {
+        rows: 8,
+        cols: 10,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 0,
+    });
+    // Two lines became four rows: the "a" rows went up into the
+    // scrollback, the prompt stays on row 3.
+    term.assert_cursor_pos(2, 3, None, None);
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["bbbbbbbbbb", "bbbbb", "", "$ ", "", "", "", ""],
     );
 }

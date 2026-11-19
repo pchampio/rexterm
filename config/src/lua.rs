@@ -792,6 +792,13 @@ pub async fn emit_event<'lua>(
     }
 }
 
+/// Allow hot paths to avoid constructing expensive callback arguments when
+/// no handler is registered. Registration remains local to this Lua state.
+pub fn has_event_handlers(lua: &Lua, name: &str) -> mlua::Result<bool> {
+    let value:mlua::Value=lua.named_registry_value(&format!("wezterm-event-{name}"))?;
+    Ok(matches!(value,mlua::Value::Table(table) if table.raw_len()>0))
+}
+
 pub fn emit_sync_callback<'lua, A>(
     lua: &'lua Lua,
     (name, args): (String, A),
@@ -876,6 +883,8 @@ mod test {
 
         let lua = make_lua_context(Path::new("testing"))?;
 
+        assert!(!has_event_handlers(&lua,"foo")?);
+
         let total = Arc::new(Mutex::new(0));
 
         let first = lua.create_function({
@@ -907,6 +916,7 @@ mod test {
         })?;
 
         register_event(&lua, ("foo".to_string(), first))?;
+        assert!(has_event_handlers(&lua,"foo")?);
         register_event(&lua, ("foo".to_string(), second))?;
         register_event(&lua, ("foo".to_string(), third))?;
         register_event(

@@ -20,6 +20,10 @@ pub struct Selection {
     pub seqno: SequenceNo,
     /// Whether the selection is rectangular
     pub rectangular: bool,
+    /// A quick-select match that spans rows the application wrapped itself
+    /// (full rows, see Screen::for_each_display_line_in_stable_range). Its
+    /// text has no newline at those row breaks while `range` is unchanged.
+    pub joined_range: Option<SelectionRange>,
 }
 
 pub use config::keyassignment::SelectionMode;

@@ -66,3 +66,7 @@ dhat-heap.json
 /__pycache__/
 /nix/result
 *.qcow2
+
+# rexterm: local logs and bundles
+/rex-*.log
+/dist/

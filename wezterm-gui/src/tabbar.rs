@@ -2,7 +2,7 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
 use termwiz::color::{AnsiColor, ColorSpec};
@@ -42,9 +42,17 @@ pub struct TabEntry {
     width: usize,
 }
 
+impl TabEntry {
+    /// The first cell and the number of cells of the entry in the tab bar.
+    pub fn span(&self) -> (usize, usize) {
+        (self.x, self.width)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TitleText {
     items: Vec<FormatItem>,
+    escapes: Option<String>,
     len: usize,
     /// True when the built-in title path rendered an indeterminate spinner
     /// frame. A custom format-tab-title callback always leaves this false.
@@ -64,20 +72,32 @@ fn call_format_tab_title(
             let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
             let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
 
-            let v = config::lua::emit_sync_callback(
+            let mut v = if config::lua::has_event_handlers(&lua,"format-tab-title")? {
+                config::lua::emit_sync_callback(
                 &*lua,
                 (
                     "format-tab-title".to_string(),
                     (
                         tab.clone(),
-                        tabs,
-                        panes,
+                        tabs.clone(),
+                        panes.clone(),
                         (**config).clone(),
                         hover,
                         tab_max_width,
                     ),
                 ),
-            )?;
+                )?
+            } else {mlua::Value::Nil};
+            // Lightweight title callbacks can close over their Lua settings.
+            // Avoid converting the entire effective Config (all bindings,
+            // colors and domains) for every tab on every frame. Existing
+            // format-tab-title handlers retain their full API and precedence.
+            if v.is_nil() {
+                v=config::lua::emit_sync_callback(&lua,(
+                    "format-tab-title-compact".to_string(),
+                    (tab.clone(),tabs,panes,hover,tab_max_width),
+                ))?;
+            }
             match &v {
                 mlua::Value::Nil => Ok(None),
                 mlua::Value::Table(_) => {
@@ -88,6 +108,7 @@ fn call_format_tab_title(
 
                     Ok(Some(TitleText {
                         items,
+                        escapes:Some(esc),
                         len: line.len(),
                         has_indeterminate: false,
                     }))
@@ -97,6 +118,7 @@ fn call_format_tab_title(
                     let line = parse_status_text(&s, CellAttributes::default());
                     Ok(Some(TitleText {
                         len: line.len(),
+                        escapes:Some(s.clone()),
                         items: vec![FormatItem::Text(s)],
                         has_indeterminate: false,
                     }))
@@ -289,6 +311,7 @@ fn compute_tab_title(
             };
 
             TitleText {
+                escapes:None,
                 len,
                 items,
                 has_indeterminate,
@@ -323,6 +346,22 @@ impl TabBarState {
 
     pub fn items(&self) -> &[TabEntry] {
         &self.items
+    }
+
+    pub fn status_text_contains_column(&self, column: usize) -> bool {
+        self.items.iter().any(|item| {
+            if !item.title.visible_cells().any(|cell| !cell.str().trim().is_empty()) {
+                return false;
+            }
+            match item.item {
+                TabBarItem::LeftStatus => (item.x..item.x + item.width).contains(&column),
+                TabBarItem::RightStatus => {
+                    let end = item.x + item.width;
+                    (end.saturating_sub(item.title.len().min(item.width))..end).contains(&column)
+                }
+                _ => false,
+            }
+        })
     }
 
     pub fn next_progress_frame_due(&self) -> Option<Instant> {
@@ -420,6 +459,13 @@ impl TabBarState {
     /// mouse_x is some if the mouse is on the same row as the tab bar.
     /// title_width is the total number of cell columns in the window.
     /// window allows access to the tabs associated with the window.
+    pub fn message(width: usize, text: &str) -> Self {
+        let mut line=parse_status_text(text, CellAttributes::default());
+        let attrs=line.get_cell(0).map(|c|c.attrs().clone()).unwrap_or_default();
+        if line.len()<width {line.fill_range(line.len()..width,&Cell::blank_with_attrs(attrs),SEQ_ZERO);}
+        line.resize(width,SEQ_ZERO);
+        Self { line, items:vec![], next_progress_frame_due:None }
+    }
     pub fn new(
         title_width: usize,
         mouse_x: Option<usize>,
@@ -571,7 +617,7 @@ impl TabBarState {
 
             has_indeterminate_progress |= tab_title.has_indeterminate;
 
-            let esc = format_as_escapes(tab_title.items.clone()).expect("already parsed ok above");
+            let esc = tab_title.escapes.clone().unwrap_or_else(||format_as_escapes(tab_title.items.clone()).expect("already parsed ok above"));
             let mut tab_line = parse_status_text(
                 &esc,
                 if config.use_fancy_tab_bar {
@@ -811,8 +857,20 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
                     _ => {}
                 }
             }
-            Action::OperatingSystemCommand(_)
-            | Action::DeviceControl(_)
+            Action::OperatingSystemCommand(osc) => {
+                flush_print(&mut print_buffer, &mut cells, &pen);
+                // An icon takes two blank cells. The first cell names the
+                // image for the painter (see render/tab_icons.rs).
+                if let Some((marker, count)) = crate::termwindow::render::tab_icons::marker_from_osc(&osc) {
+                    let mut first = pen.clone();
+                    first.set_hyperlink(Some(Arc::new(termwiz::hyperlink::Hyperlink::new(marker))));
+                    cells.push(Cell::blank_with_attrs(first));
+                    for _ in 1..count {
+                        cells.push(Cell::blank_with_attrs(pen.clone()));
+                    }
+                }
+            }
+            Action::DeviceControl(_)
             | Action::Esc(_)
             | Action::KittyImage(_)
             | Action::XtGetTcap(_)

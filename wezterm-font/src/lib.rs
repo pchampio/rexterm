@@ -473,6 +473,8 @@ struct FontConfigInner {
     pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
+    /// The terminal font at reduced sizes (window previews), by tenth of a point.
+    preview_fonts: RefCell<HashMap<u32, Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -494,6 +496,7 @@ impl FontConfigInner {
             pane_select_font: RefCell::new(None),
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
+            preview_fonts: RefCell::new(HashMap::new()),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
@@ -512,6 +515,7 @@ impl FontConfigInner {
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
+        self.preview_fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
         Ok(())
@@ -650,6 +654,38 @@ impl FontConfigInner {
             pixel_geometry: config.display_pixel_geometry,
         });
 
+        Ok(loaded)
+    }
+
+    /// The configured terminal font at `font_size` points (window previews).
+    fn preview_font(&self, myself: &Rc<Self>, font_size: f64) -> anyhow::Result<Rc<LoadedFont>> {
+        let font_size = (font_size * 10.).round().max(10.) / 10.;
+        let key = (font_size * 10.) as u32;
+        if let Some(entry) = self.preview_fonts.borrow().get(&key) {
+            return Ok(Rc::clone(entry));
+        }
+        let config = self.config.borrow();
+        let dpi = *self.dpi.borrow() as u32;
+        let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
+        let attributes = config.font.font_with_fallback();
+        let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+        let shaper = new_shaper(&*config, &handles)?;
+        let metrics = shaper.metrics(font_size, dpi)?;
+        let loaded = Rc::new(LoadedFont {
+            rasterizers: RefCell::new(HashMap::new()),
+            handles: RefCell::new(handles),
+            shaper: RefCell::new(shaper),
+            metrics,
+            font_size,
+            dpi,
+            font_config: Rc::downgrade(myself),
+            pending_fallback: Arc::new(Mutex::new(vec![])),
+            text_style: config.font.clone(),
+            id: alloc_font_id(),
+            tried_glyphs: RefCell::new(HashSet::new()),
+            pixel_geometry: config.display_pixel_geometry,
+        });
+        self.preview_fonts.borrow_mut().insert(key, Rc::clone(&loaded));
         Ok(loaded)
     }
 
@@ -955,6 +991,7 @@ impl FontConfigInner {
         self.fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
+        self.preview_fonts.borrow_mut().clear();
 
         (prior_font, prior_dpi)
     }
@@ -1073,6 +1110,11 @@ impl FontConfiguration {
 
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.pane_select_font(&self.inner)
+    }
+
+    /// The terminal font at `font_size` points, for scaled-down previews.
+    pub fn preview_font(&self, font_size: f64) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.preview_font(&self.inner, font_size)
     }
 
     pub fn char_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {

@@ -27,6 +27,7 @@ impl crate::TermWindow {
 
         let pos_y = split.top as f32 * cell_height + first_row_offset + padding_top;
         let pos_x = split.left as f32 * cell_width + padding_left + border.left.get() as f32;
+        log::debug!(target: "resize_latency", "SPLIT_PAINTED {} {} {}", pane.pane_id(), split.left, split.top);
 
         if split.direction == SplitDirection::Horizontal {
             self.filled_rectangle(
