@@ -369,14 +369,17 @@ function M.apply(config, wezterm, module_dir)
     perform(w,p,act.PopupMenu{title='Readline Bindings',items=items})
   end)
   local command_prompt=callback(function(w,p)
-    perform(w,p,act.PromptInputLine{description='Rex command',bottom=true,prompt=':',completion={'rename ','renamew ','rename-window ','rename-session ','new-window','split-window','split-window -h','select-window ','detach-client','kill-pane','kill-window','kill-tab','kill-session','kill-server'},action=callback(function(win,pane,text)
+    perform(w,p,act.PromptInputLine{description='Rex command',bottom=true,prompt=':',completion={'rename-session ','rename-window ','new-window','select-window ','detach-client','kill-pane','kill-window','kill-tab','kill-session','kill-server'},action=callback(function(win,pane,text)
       if not text then return end
       local command,arg=text:match('^(%S+)%s*(.-)%s*$')
-      if command=='renamew' or command=='rename-window' then
+      -- Without a name, rename-* and select-window ask, like their prefix keys.
+      if (command=='renamew' or command=='rename-window') and arg=='' then perform(win,pane,rename('session.set_window_label','window_id','Rename window'))
+      elseif (command=='rename' or command=='rename-session') and arg=='' then perform(win,pane,rename('session.set_label',nil,'Rename session'))
+      elseif command=='select-window' and arg=='' then switch_window(win,pane)
+      elseif command=='renamew' or command=='rename-window' then
         local c=context(pane);if c then call(pane,'session.set_window_label',{window_id=c.window_id,label=arg}) else win:active_tab():set_title(arg) end
       elseif command=='rename' or command=='rename-session' then call(pane,'session.set_label',{label=arg})
       elseif command=='new-window' then new_window(win,pane)
-      elseif command=='split-window' then perform(win,pane,arg=='-h' and act.SplitHorizontal{domain='CurrentPaneDomain'} or act.SplitVertical{domain='CurrentPaneDomain'})
       elseif command=='select-window' then perform(win,pane,act.ActivateTab((tonumber(arg) or 1)-1))
       elseif command=='detach' or command=='detach-client' then hide_or_detach(win,pane)
       -- tmux names. kill-window and kill-tab close the Rex window (a GUI tab).
@@ -389,7 +392,8 @@ function M.apply(config, wezterm, module_dir)
         call(pane,'session.destroy',{session_id=c.session_id})
       elseif command=='kill-server' then
         local c=context(pane);if not c then error('kill-server needs a Rex pane') end
-        call(pane,'server.stop',{});perform(win,pane,act.DetachDomain('CurrentPaneDomain'))
+        -- Every session goes, so the next start does not restore them.
+        server_action(pane,'wezterm_kill_server');perform(win,pane,act.DetachDomain('CurrentPaneDomain'))
       else error('Unknown Rex workflow command: '..tostring(command)) end
     end)})
   end)

@@ -1,4 +1,7 @@
 //! A status-row command line with literal completion, owned by the GUI.
+//! Tab and Shift-Tab (or the arrows) move a highlight through the matching
+//! commands. Enter puts the highlighted command in the line, and an Enter
+//! without a highlight runs the line.
 use super::{TermWindow, box_model::*, modal::Modal};
 use crate::{scripting::guiwin::GuiWin, utilsprites::RenderMetrics};
 use config::{
@@ -14,7 +17,10 @@ pub struct CommandPrompt {
     args: PromptInputLine,
     pane: PaneId,
     input: RefCell<LineEditBuffer>,
-    selected: Cell<usize>,
+    /// The highlighted candidate, if Tab or an arrow moved through the list.
+    selected: Cell<Option<usize>>,
+    /// The first visible candidate: the list scrolls with the highlight.
+    offset: Cell<usize>,
     elements: RefCell<Option<Vec<ComputedElement>>>,
     rows: RefCell<Vec<window::RectF>>,
 }
@@ -26,7 +32,8 @@ impl CommandPrompt {
             args,
             pane,
             input,
-            selected: Cell::new(0),
+            selected: Cell::new(None),
+            offset: Cell::new(0),
             elements: RefCell::new(None),
             rows: RefCell::new(vec![]),
         }
@@ -36,7 +43,7 @@ impl CommandPrompt {
         self.args
             .completion
             .iter()
-            .filter(|s| s.starts_with(input.get_line()))
+            .filter(|s| s.starts_with(input.get_line()) && s.as_str() != input.get_line())
             .cloned()
             .collect()
     }
@@ -44,7 +51,24 @@ impl CommandPrompt {
         if let Some(s) = self.candidates().get(index) {
             self.input.borrow_mut().set_line_and_cursor(s, s.len());
         }
-        self.selected.set(0);
+        self.reset();
+    }
+    fn reset(&self) {
+        self.selected.set(None);
+        self.offset.set(0);
+    }
+    fn step(&self, forward: bool) {
+        let n = self.candidates().len();
+        if n == 0 {
+            return;
+        }
+        self.selected
+            .set(Some(match (self.selected.get(), forward) {
+                (None, true) => 0,
+                (None, false) => n - 1,
+                (Some(i), true) => (i + 1) % n,
+                (Some(i), false) => (i + n - 1) % n,
+            }));
     }
     fn finish(&self, window: &mut TermWindow, accept: bool) {
         if let KeyAssignment::EmitEvent(name) = self.args.action.as_ref() {
@@ -126,6 +150,21 @@ impl CommandPrompt {
             .len()
             .min(((y / ch) as usize).saturating_sub(2))
             .min(10);
+        // Scroll so that the highlight stays visible.
+        let mut offset = self
+            .offset
+            .get()
+            .min(candidates.len().saturating_sub(count));
+        if let Some(i) = self.selected.get() {
+            if i < offset {
+                offset = i;
+            } else if count > 0 && i >= offset + count {
+                offset = i + 1 - count;
+            }
+        }
+        self.offset.set(offset);
+        let more_above = offset > 0;
+        let more_below = offset + count < candidates.len();
         let menu_width = ((candidates
             .iter()
             .map(|s| termwiz::cell::unicode_column_width(s, None))
@@ -146,12 +185,19 @@ impl CommandPrompt {
                     .colors(colors(palette.background, palette.foreground)),
                 euclid::rect(x + cw / 2., top, menu_width, height),
             )?);
-            for (i, s) in candidates.iter().take(count).enumerate() {
+            for (i, s) in candidates.iter().skip(offset).take(count).enumerate() {
                 let bounds =
                     euclid::rect(x + cw, top + ch / 2. + i as f32 * ch, menu_width - cw, ch);
-                let active = i == self.selected.get().min(count - 1);
+                let active = self.selected.get() == Some(offset + i);
+                let mark = if i == 0 && more_above {
+                    "↑"
+                } else if i + 1 == count && more_below {
+                    "↓"
+                } else {
+                    " "
+                };
                 let children = vec![
-                    Element::new(&font, ElementContent::Text(format!(" {s}"))),
+                    Element::new(&font, ElementContent::Text(format!("{mark}{s}"))),
                     Element::new(&font, ElementContent::Text(format!("({i}) ")))
                         .float(Float::Right),
                 ];
@@ -190,22 +236,23 @@ impl Modal for CommandPrompt {
             (KeyCode::Escape, _) | (KeyCode::Char('c' | 'g'), KeyModifiers::CTRL) => {
                 self.finish(window, false)
             }
-            (KeyCode::Enter, _) => self.finish(window, true),
-            (KeyCode::Tab, _) => self.complete(self.selected.get()),
+            (KeyCode::Enter, _) => match self.selected.get() {
+                Some(i) => self.complete(i),
+                None => self.finish(window, true),
+            },
+            (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => self.step(false),
+            (KeyCode::Tab, _) => self.step(true),
             (KeyCode::Char(c @ '0'..='9'), KeyModifiers::ALT) => {
-                self.complete(c as usize - '0' as usize)
+                let i = c as usize - '0' as usize;
+                if i < self.rows.borrow().len() {
+                    self.complete(self.offset.get() + i)
+                }
             }
             (KeyCode::UpArrow, _) | (KeyCode::Char('k' | 'p'), KeyModifiers::CTRL) => {
-                let n = self.candidates().len().min(10);
-                if n > 0 {
-                    self.selected.set((self.selected.get() + n - 1) % n);
-                }
+                self.step(false)
             }
             (KeyCode::DownArrow, _) | (KeyCode::Char('j' | 'n'), KeyModifiers::CTRL) => {
-                let n = self.candidates().len().min(10);
-                if n > 0 {
-                    self.selected.set((self.selected.get() + 1) % n);
-                }
+                self.step(true)
             }
             (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CTRL) => {
                 self.input.borrow_mut().exec_movement(Movement::StartOfLine)
@@ -239,9 +286,16 @@ impl Modal for CommandPrompt {
                 .kill_text(Movement::ForwardChar(1), Movement::None),
             (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.input.borrow_mut().insert_char(c);
-                self.selected.set(0);
+                self.reset();
             }
             _ => {}
+        }
+        if matches!(
+            (key, mods),
+            (KeyCode::Backspace | KeyCode::Delete, _)
+                | (KeyCode::Char('h' | 'w' | 'u' | 'd'), KeyModifiers::CTRL)
+        ) {
+            self.reset();
         }
         window.invalidate_modal();
         Ok(true)
@@ -255,7 +309,7 @@ impl Modal for CommandPrompt {
                 r.contains(euclid::point2(event.coords.x as f32, event.coords.y as f32))
             });
             if let Some(i) = hit {
-                self.complete(i);
+                self.complete(self.offset.get() + i);
                 window.invalidate_modal();
             }
         }
