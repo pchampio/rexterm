@@ -30,6 +30,10 @@ pub struct Actor {
     desired_size: Arc<Mutex<Option<TerminalSize>>>,
     _lifetime: flume::Sender<()>,
     activate: flume::Sender<()>,
+    /// A terminal of a session that the GUI left: the server closed its data
+    /// channel, and it does not try again until `park(false)` wakes it.
+    parked: Arc<std::sync::atomic::AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 }
 #[derive(Debug)]
 struct DefaultConfig;
@@ -73,6 +77,11 @@ impl Actor {
         Self::start_with_config_deferred(endpoint,client,session,block,config,notify,wait_ready,false).await
     }
     pub fn activate(&self) {self.activate.try_send(()).ok();}
+    /// Park (no reconnect attempts) or wake: a woken terminal reconnects at once.
+    pub fn park(&self, parked: bool) {
+        self.parked.store(parked, std::sync::atomic::Ordering::Relaxed);
+        if !parked {self.wake.notify_one();}
+    }
     /// Inactive tabs do not need a snapshot or data socket until displayed.
     pub async fn start_with_config_deferred(endpoint: String, client: Client, session: String, block: String,
                        config: Arc<dyn TerminalConfiguration>,
@@ -90,6 +99,9 @@ impl Actor {
         let (ready_tx, ready_rx) = flume::bounded(1);
         let (activate, activated) = flume::bounded(1);
         if !deferred || wait_ready {activate.send(()).ok();}
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (parked_loop, wake_loop) = (parked.clone(), wake.clone());
         std::thread::Builder::new().name("rex-terminal".into()).spawn(move || {
             let result = (|| -> Result<()> {
                 tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
@@ -123,7 +135,15 @@ impl Actor {
                                     let reconnect = async {
                                         let mut attempt=0u32;
                                         loop {
-                                            tokio::time::sleep(Duration::from_millis(100 << attempt.min(4))).await;
+                                            if parked_loop.load(std::sync::atomic::Ordering::Relaxed) {
+                                                wake_loop.notified().await;
+                                            } else {
+                                                // A wake (the session shows again) tries at once.
+                                                tokio::select! {
+                                                    _=tokio::time::sleep(Duration::from_millis(100 << attempt.min(4)))=>{},
+                                                    _=wake_loop.notified()=>{},
+                                                }
+                                            }
                                             attempt=attempt.saturating_add(1);
                                             if let Ok(mut socket)=transport::socket(&endpoint,"/api/data",wire::PROTOCOL).await {
                                                 if let Ok(w)=wire::resume(&mut socket,&resume_token,resume_offset).await {
@@ -161,7 +181,7 @@ impl Actor {
             }
         })?;
         if wait_ready {ready_rx.recv_async().await??;}
-        Ok(Self { frame, terminal, desired_size, _lifetime: lifetime, activate })
+        Ok(Self { frame, terminal, desired_size, _lifetime: lifetime, activate, parked, wake })
     }
     pub fn lines(&self, range: Range<isize>) -> (isize, Vec<Line>) {
         self.activate();

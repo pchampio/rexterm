@@ -72,7 +72,14 @@ struct State {
     /// them after the last view: a closed active tab goes to its left neighbor.
     tab_order: Vec<String>,
     active_tab_window: Option<String>,
+    /// The terminals of the sessions that you left last, by session (the
+    /// most recent first in parked_order). Their data channels stay open, so
+    /// a switch back shows them at once instead of opening each terminal again.
+    parked_panes: HashMap<String, HashMap<String, Arc<RexPane>>>,
+    parked_order: Vec<String>,
 }
+/// How many left sessions keep their terminals.
+const PARKED_SESSIONS: usize = 3;
 
 /// The frame of an agent shell popup: the command, its state, and the keys.
 fn agent_popup_frame(info: Option<&(String, Option<i64>)>) -> PopupFrame {
@@ -732,30 +739,99 @@ impl RexDomain {
         }
         let old_panes=self.state.lock().panes.values().cloned().collect::<Vec<_>>();
         for pane in &old_panes {pane.input.lock().suspended=true;}
-        let response = match client.call("session.attach", json!({"session_id":session})).await {
+        let attach = client.enqueue("session.attach", json!({"session_id":session}));
+        // The kept terminals of the target session: claim them in the same
+        // round trip as the attach (the requests keep their order).
+        let kept: Vec<String> = self.state.lock().parked_panes.get(&session)
+            .map(|panes| panes.keys().cloned().collect()).unwrap_or_default();
+        let claim = match &attach {
+            Ok(_) if !kept.is_empty() => client.enqueue("session.own_block",
+                json!({"session_id":session,"block_ids":kept,"mode":"take"})).ok(),
+            _ => None,
+        };
+        // Their data channels reconnect now: the requests go after the attach.
+        let waking: Vec<Arc<RexPane>> = self.state.lock().parked_panes.get(&session)
+            .map(|panes| panes.values().cloned().collect()).unwrap_or_default();
+        if attach.is_ok() { for pane in &waking { pane.actor.park(false); } }
+        let response = match async { attach?.await }.await {
             Ok(response)=>response,
             Err(error)=>{
                 for pane in &old_panes {pane.input.lock().suspended=false;}
+                for pane in &waking { pane.actor.park(true); }
                 return Err(error);
             }
         };
-        let reopen = {
+        let (reopen, restored) = {
             let mut state = self.state.lock();
             // The open agent popups stay with their session: their panes go
             // with the session's other panes, and come back with it.
             let open = std::mem::take(&mut state.agent_popups);
             state.agent_popups_new.clear();
             // Panel previews of the old session go too (the panel asks again).
-            state.agent_watch.clear();
+            let watched = std::mem::take(&mut state.agent_watch);
+            // Keep the terminals of the old session (not its popups and
+            // previews, which open again as before). Marked dead, they send
+            // nothing (and no close) while the server sees another session.
+            let leaving: HashMap<String, Arc<RexPane>> = state.panes.iter()
+                .filter(|(block, _)| !open.contains_key(*block) && !watched.contains(*block))
+                .map(|(block, pane)| (block.clone(), pane.clone())).collect();
+            for (block, pane) in &leaving {
+                pane.dead.store(true, Ordering::Relaxed);
+                pane.actor.park(true);
+                state.panes.remove(block);
+            }
+            state.parked_order.retain(|s| *s != previous && *s != session);
+            if !leaving.is_empty() {
+                state.parked_panes.insert(previous.clone(), leaving);
+                state.parked_order.insert(0, previous.clone());
+            }
+            let keep = state.parked_order.len().min(PARKED_SESSIONS);
+            for old in state.parked_order.split_off(keep) {
+                state.parked_panes.remove(&old);
+            }
             if !open.is_empty() { state.agent_popups_parked.insert(previous.clone(), open); }
             state.session = session.clone();
             state.revision = None;
+            let restored = state.parked_panes.remove(&session).unwrap_or_default();
+            for (block, pane) in &restored {
+                pane.dead.store(false, Ordering::Relaxed);
+                pane.input.lock().suspended = false;
+                // It shows its last frame at once and reconnects now; input
+                // goes over the control channel meanwhile.
+                {let mut frame = pane.actor.frame.lock().unwrap(); frame.connected = true; frame.error = None;}
+                pane.actor.park(false);
+                state.panes.insert(block.clone(), pane.clone());
+            }
             let reopen = state.agent_popups_parked.remove(&session).unwrap_or_default();
-            log::debug!("Rex session switch {previous} -> {session}: parked {} popups, reopening {}",
-                state.agent_popups_parked.get(&previous).map_or(0, |p| p.len()), reopen.len());
-            reopen
+            log::debug!("Rex session switch {previous} -> {session}: parked {} popups, reopening {}, kept {} terminals, reused {}",
+                state.agent_popups_parked.get(&previous).map_or(0, |p| p.len()), reopen.len(),
+                state.parked_panes.get(&previous).map_or(0, |p| p.len()), restored.len());
+            (reopen, restored.into_values().collect::<Vec<_>>())
         };
+        let mux = Mux::get();
+        for pane in &restored {
+            let dynpane: Arc<dyn Pane> = pane.clone();
+            mux.add_pane(&dynpane)?;
+        }
         self.apply_view(response["view"].clone()).await?;
+        // A kept terminal missed the events of its session while you were
+        // away: ask for its state again (not before it shows).
+        let claimed = match claim { Some(claim) => claim.await.is_ok(), None => true };
+        for pane in restored {
+            if pane.dead.load(Ordering::Relaxed) { continue; }
+            let client = client.clone(); let session = session.clone();
+            promise::spawn::spawn(async move {
+                if !claimed {
+                    if let Err(error) = client.call("session.own_block", json!({"session_id":session,"block_ids":[pane.block],"mode":"take"})).await {
+                        log::debug!("Rex kept terminal: {error:#}");
+                    }
+                }
+                let (status, process) = smol::future::zip(pane.refresh_status(), pane.refresh_process()).await;
+                if let Err(error) = status.and(process) { log::debug!("Rex kept terminal metadata: {error:#}"); }
+                let size = *pane.size.lock();
+                if let Err(error) = pane.send_size(size) { log::debug!("Rex kept terminal size: {error:#}"); }
+            }).detach();
+        }
         if !reopen.is_empty() {
             for (block, window) in reopen {
                 // The command may have ended and its terminal closed meanwhile.
@@ -765,9 +841,12 @@ impl RexDomain {
             }
             self.relayout().await?;
         }
-        client
-            .call("session.detach", json!({"session_id":previous}))
-            .await?;
+        // The new session shows already: the detach of the old one does not
+        // hold the switch (it goes out now, so it stays before a later attach).
+        let detach = client.enqueue("session.detach", json!({"session_id":previous}))?;
+        promise::spawn::spawn(async move {
+            if let Err(error) = detach.await { log::error!("Rex session detach: {error:#}"); }
+        }).detach();
         Ok(())
     }
     pub fn move_floating_pane(&self, pane_id: PaneId, left: usize, top: usize) {
@@ -1124,6 +1203,8 @@ impl Domain for RexDomain {
             s.generation += 1;
             s.client = None;
             s.revision = None;
+            s.parked_panes.clear();
+            s.parked_order.clear();
             (std::mem::take(&mut s.tabs), std::mem::take(&mut s.panes))
         };
         for (_, p) in panes {
