@@ -67,7 +67,9 @@ status itself (OSC 7501), and its hooks add the commands.
 - tmux keys with `Ctrl-Space` as the prefix, and a `prefix a` menu.
 - A `prefix ;` command prompt with the tmux commands, for example `kill-pane`,
   `kill-window`, `kill-session` and `kill-server`.
-- Copy mode jumps between commands: `prefix K` selects the previous command.
+- Copy mode jumps between commands: `Ctrl-k` and `Ctrl-j` move to the previous
+  or next command, and `Shift-Y` selects the command at the cursor (multi-line
+  commands included). `prefix K` selects the previous command at once.
 - `Ctrl-h/j/k/l` move between panes and go through Neovim splits and pickers
   (fzf, Ctrl-R history).
 - The window mosaic (`prefix a`, then `M`) shows every window of the session

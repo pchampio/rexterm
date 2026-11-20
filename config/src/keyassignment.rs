@@ -794,9 +794,13 @@ pub enum CopyModeAssignment {
     /// screen. `direction`: -1 the command above, 1 the command below, 0 the
     /// command at the cursor. `prompt_marker` finds the command on a row
     /// that has no OSC 133 marks: the text after the marker.
+    /// `select`: false moves the cursor to the start of the command and
+    /// selects nothing (in visual mode, the selection still extends).
     SelectCommand {
         direction: isize,
         prompt_marker: Option<String>,
+        #[dynamic(default = "default_true")]
+        select: bool,
     },
     /// While editing a search: the previous (-1) or next (1) pattern of the
     /// search history.

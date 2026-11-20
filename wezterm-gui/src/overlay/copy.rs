@@ -331,7 +331,7 @@ impl CopyRenderable {
     /// Select the shell command above, below or at the cursor, and shade
     /// the commands on screen. The cursor stays on the last cell of the
     /// command, as the anchor of the next jump.
-    fn select_command(&mut self, direction: isize, prompt_marker: Option<&str>) {
+    fn select_command(&mut self, direction: isize, prompt_marker: Option<&str>, select: bool) {
         use wezterm_term::commands::{find_command, CommandTarget};
         let zones = self.delegate.get_semantic_zones().unwrap_or_default();
         // Visual mode (a selection that the user started): extend it by
@@ -352,6 +352,16 @@ impl CopyRenderable {
         });
         if let Some(range) = found {
             self.clear_selection_mode();
+            if !select {
+                // Only move: the cursor goes to the start of the command.
+                self.selection_mode = SelectionMode::Cell;
+                self.command_selection = false;
+                self.cursor.x = range.start_x;
+                self.cursor.y = range.start_y;
+                self.select_to_cursor_pos();
+                self.set_command_highlight(true);
+                return;
+            }
             self.cursor.x = range.start_x;
             self.cursor.y = range.start_y;
             self.start.replace(SelectionCoordinate::x_y(range.start_x, range.start_y));
@@ -1618,7 +1628,7 @@ impl Pane for CopyOverlay {
                         render.selection_mode = *mode;
                         render.select_to_cursor_pos();
                     }
-                    SelectCommand{direction,prompt_marker} => render.select_command(*direction,prompt_marker.as_deref()),
+                    SelectCommand{direction,prompt_marker,select} => render.select_command(*direction,prompt_marker.as_deref(),*select),
                     CommandSelection(enabled) => { render.command_selection=*enabled; render.window.invalidate(); }
                     MoveToCoordinates{x,y} => {
                         let dims=render.delegate.get_dimensions();

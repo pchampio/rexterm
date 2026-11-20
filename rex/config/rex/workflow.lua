@@ -320,8 +320,10 @@ function M.apply(config, wezterm, module_dir)
   -- Rust finds the command from the shell's OSC 133 input cells (wrapped and
   -- continuation rows included) and shades the commands on screen. The marker
   -- is for rows without OSC 133 marks: the command is the text after it.
-  local function command_jump(direction,enter)
-    local jump=act.CopyMode{SelectCommand={direction=direction,prompt_marker='$~'}}
+  -- select=false moves to the start of the command without selecting it:
+  -- Shift-Y selects the command at the cursor.
+  local function command_jump(direction,enter,select)
+    local jump=act.CopyMode{SelectCommand={direction=direction,prompt_marker='$~',select=select~=false}}
     return enter and act.Multiple{act.ActivateCopyMode,jump} or jump
   end
   local select_command=command_jump(0,true)
@@ -591,7 +593,7 @@ function M.apply(config, wezterm, module_dir)
     if applications[name] and (vars.nvimmode=='n' or vars.NVIM_MODE=='n') then perform(w,p,act.SendKey{key='f',mods='CTRL'}) else perform(w,p,extract) end
   end))
   bind('/','ALT',readline);bind(';','LEADER',command_prompt)
-  bind('j','LEADER|CTRL',command_jump(-1,true));bind('k','LEADER|CTRL',command_jump(-1,true))
+  bind('j','LEADER|CTRL',command_jump(-1,true,false));bind('k','LEADER|CTRL',command_jump(-1,true,false))
   bind('B','LEADER',last_output);bind('P','LEADER',capture);bind('Y','LEADER',select_command);bind('g','LEADER',path_select);bind('_','LEADER',break_pane)
   bind(']','LEADER',callback(paste))
   bind('.','LEADER',callback(function(w,p)perform(w,p,act.CopyTextTo{text=cwd(p) or '',destination='ClipboardAndPrimarySelection'})end))
@@ -637,9 +639,9 @@ function M.apply(config, wezterm, module_dir)
   cb('v','NONE',act.CopyMode{SetSelectionMode='Cell'});cb('V','SHIFT',act.CopyMode{SetSelectionMode='Line'})
   cb('v','CTRL',act.CopyMode{SetSelectionMode='Block'});cb('Space','NONE',act.CopyMode{SetSelectionMode='Cell'})
   cb('q','NONE',act.Multiple{act.CopyMode('Close'),act.ClearSelection,act.ScrollToBottom});cb('Escape','NONE',act.Multiple{act.CopyMode('Close'),act.ClearSelection,act.ScrollToBottom})
-  cb('j','CTRL',command_jump(1,false));cb('k','CTRL',command_jump(-1,false))
-  -- Shift-J/K do what Ctrl-j/k do (select or, in visual mode, extend by command).
-  cb('K','SHIFT',command_jump(-1,false));cb('J','SHIFT',command_jump(1,false))
+  cb('j','CTRL',command_jump(1,false,false));cb('k','CTRL',command_jump(-1,false,false))
+  -- Shift-J/K do what Ctrl-j/k do (move to a command or, in visual mode, extend by command).
+  cb('K','SHIFT',command_jump(-1,false,false));cb('J','SHIFT',command_jump(1,false,false))
   cb('Y','SHIFT',callback(function(w,p) local text=w:get_selection_text_for_pane(p);perform(w,p,text and text~='' and copy(true,true) or select_command) end));cb('o','NONE',open_selection(false));cb('O','SHIFT',open_selection(true))
   cb('s','NONE',callback(function(w,p)local text=w:get_selection_text_for_pane(p);if text and text~='' then wezterm.open_with('https://www.google.com/search?q='..text:gsub('[^%w%-_%.~]',function(c)return string.format('%%%02X',c:byte())end)) end end))
   cb('H','SHIFT',act.CopyMode('MoveToStartOfLine'));cb('L','SHIFT',act.CopyMode('MoveToEndOfLineContent'))
