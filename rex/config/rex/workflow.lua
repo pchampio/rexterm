@@ -648,6 +648,15 @@ function M.apply(config, wezterm, module_dir)
   cb('j','ALT',act.CopyMode{ScrollByLine=2});cb('k','ALT',act.CopyMode{ScrollByLine=-2})
   cb('/','NONE',act.CopyMode('SearchBackward'));cb('?','SHIFT',act.CopyMode('SearchForward'));cb('?','NONE',act.CopyMode('SearchForward'))
   cb('n','NONE',act.CopyMode('SearchAgain'));cb('N','SHIFT',act.CopyMode('SearchReverse'))
+  -- f/F and t/T as vim-sneak in nvim: f jumps to one character, t to two
+  -- characters with labels on the other matches of the screen, both over
+  -- several lines; the matches show, and f/t again go to the next one.
+  -- : (and ;) repeats the last jump, , goes back.
+  cb('t','NONE',act.CopyMode{Sneak={forward=true}})
+  cb('T','SHIFT',act.CopyMode{Sneak={forward=false}});cb('T','NONE',act.CopyMode{Sneak={forward=false}})
+  cb(':','SHIFT',act.CopyMode('JumpAgain'));cb(':','NONE',act.CopyMode('JumpAgain'))
+  -- Ctrl-e/Ctrl-y: scroll one line, the cursor stays on its text (as in vim).
+  cb('e','CTRL',act.CopyMode{ScrollViewport=1});cb('y','CTRL',act.CopyMode{ScrollViewport=-1})
   tables.search_mode=wezterm.gui.default_key_tables().search_mode
   for _,key in ipairs{'a','e','w','b','f','h','k'} do
     tables.search_mode[#tables.search_mode+1]={key=key,mods='CTRL',action=act.SendKey{key=key,mods='CTRL'}}
@@ -695,8 +704,17 @@ function M.apply(config, wezterm, module_dir)
   end
   -- A plain drag becomes native copy mode, preserving its exact anchor. The
   -- GUI's existing drag/autoscroll engine supplies the selection coordinates.
+  local click_copy=act.QuickSelectArgs{label='click-copy',patterns={'jksfldjjkfdsljflflsdkfjlsdjfdsfjlsdjflksdjklf'}}
   local drag_copy=callback(function(w,p)
-    local range=w:selection_state(p);if not range then return end
+    local range=w:selection_state(p)
+    if not range then
+      -- A program that takes the mouse (htop, nvim) gets plain clicks; WezTerm
+      -- drops Shift from a Shift-click before it looks for a binding, so a
+      -- Shift-click without a drag lands here: start click copy.
+      local ok,grabbed=pcall(function()return p:is_mouse_grabbed()end)
+      if ok and grabbed then perform(w,p,click_copy) end
+      return
+    end
     perform(w,p,act.ActivateCopyMode)
     perform(w,p,act.Multiple{act.CopyMode('ClearSelectionMode'),act.CopyMode{MoveToCoordinates=range.start},
       act.CopyMode{SetSelectionMode=range.block and 'Block' or 'Cell'},act.CopyMode{MoveToCoordinates=range['end']}})
@@ -707,7 +725,7 @@ function M.apply(config, wezterm, module_dir)
   mouse({Up={streak=1,button='Left'}},'SHIFT',callback(function(w,p)
     local text=w:get_selection_text_for_pane(p)
     if text and text~='' then perform(w,p,act.CopyTo('ClipboardAndPrimarySelection'))
-    else perform(w,p,act.QuickSelectArgs{label='click-copy',patterns={'jksfldjjkfdsljflflsdkfjlsdjfdsfjlsdjflksdjklf'}}) end
+    else perform(w,p,click_copy) end
   end),act.CompleteSelection('PrimarySelection'))
 end
 return M

@@ -118,23 +118,40 @@ impl CopyOverlay {
         let cursor = r.editing_search.then(|| 1 + unicode_column_width(&r.search_line.get_line()[..r.search_line.get_cursor()], None));
         (line, cursor)
     }
+    /// The next keys go to f/t (their target or a label), not to bindings.
+    pub fn captures_keys(&self) -> bool {
+        self.render.lock().captures_keys()
+    }
+    /// For tests: the labels on the screen and whether the matches show.
+    pub fn jump_state(&self) -> (Vec<(char, isize, usize)>, usize, bool) {
+        let r = self.render.lock();
+        (r.sneak_labels.clone(), r.sneak_marks.values().map(|m| m.len()).sum(), r.pending_jump.is_some())
+    }
     pub fn cursor_and_selection(&self)->(usize,isize,Option<(usize,isize)>,bool,isize,usize,String,bool,bool) {
         let r=self.render.lock();
         (r.cursor.x,r.cursor.y,r.start.map(|p|(match p.x {SelectionX::Cell(x)=>x,SelectionX::BeforeZero=>0},p.y)),r.selection_mode==SelectionMode::Block,r.viewport.unwrap_or(self.delegate.get_dimensions().physical_top),r.results.len(),r.search_line.get_line().to_owned(),r.editing_search,r.highlight_commands)
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+/// The labels of a two-character jump, in the order of vim-sneak with t
+/// mapped to Sneak_s and sneak#s_next (t first: t again goes to the next match).
+const SNEAK_LABELS: &str = "t;sfunq/SFGHLTUNRMQZ?0";
+
+#[derive(Clone, Debug)]
 struct PendingJump {
     forward: bool,
     prev_char: bool,
+    /// Two characters and labels (vim-sneak s), else one character (f).
+    label: bool,
+    typed: String,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Jump {
     forward: bool,
     prev_char: bool,
-    target: char,
+    label: bool,
+    target: String,
 }
 
 struct CopyRenderable {
@@ -182,6 +199,16 @@ struct CopyRenderable {
     searching: Option<Searching>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
+    /// Right after f/t: the matches show, and f/t again go to the next one.
+    sneak_active: bool,
+    /// The highlighted matches by row: the cells, and the label on them.
+    sneak_marks: HashMap<StableRowIndex, Vec<(Range<usize>, Option<char>)>>,
+    /// Label mode: the label and the cell of each labeled match.
+    sneak_labels: Vec<(char, StableRowIndex, usize)>,
+    /// The matches after the labeled ones (Tab labels them).
+    sneak_rest: Vec<(StableRowIndex, usize, usize)>,
+    /// The assignment of the key that ends label mode, done after it.
+    sneak_deferred: Option<KeyAssignment>,
 }
 
 struct Searching {
@@ -272,6 +299,11 @@ impl CopyOverlay {
             searching: None,
             pending_jump: None,
             last_jump: None,
+            sneak_active: false,
+            sneak_marks: HashMap::new(),
+            sneak_labels: vec![],
+            sneak_rest: vec![],
+            sneak_deferred: None,
         };
 
         let search_row = render.compute_search_row();
@@ -834,10 +866,15 @@ impl CopyRenderable {
     }
 
     fn set_viewport(&mut self, row: Option<StableRowIndex>) {
+        let dims = self.delegate.get_dimensions();
+        // Never above the scrollback or below the live screen: the smooth
+        // scroll would animate to that row and then snap back (k on the
+        // top row of a pane without scrollback).
+        let row = row.map(|r| r.min(dims.physical_top).max(dims.scrollback_top));
+        log::debug!(target: "copy_scroll", "COPY_VIEWPORT {row:?} scrollback_top {}", dims.scrollback_top);
         self.viewport = row;
         let requests = self.viewport_request.clone();
         let request = requests.fetch_add(1, Ordering::Relaxed) + 1;
-        let dims = self.delegate.get_dimensions();
         let pane_id = self.delegate.pane_id();
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -866,6 +903,20 @@ impl CopyRenderable {
         self.scrolling=true;
         self.select_to_cursor_pos();
         self.scrolling=false;
+        self.set_viewport(Some(top));
+    }
+
+    fn scroll_viewport(&mut self, amount: isize) {
+        let dims = self.delegate.get_dimensions();
+        let old = self.viewport.unwrap_or(dims.physical_top);
+        let top = (old + amount).clamp(dims.scrollback_top, dims.physical_top);
+        if top == old { return; }
+        let rows = dims.viewport_rows.max(1) as isize;
+        self.cursor.y = self.cursor.y.clamp(top, top + rows - 1);
+        self.viewport = Some(top);
+        self.scrolling = true;
+        self.select_to_cursor_pos();
+        self.scrolling = false;
         self.set_viewport(Some(top));
     }
 
@@ -1358,74 +1409,193 @@ impl CopyRenderable {
         self.select_to_cursor_pos();
     }
 
-    fn perform_jump(&mut self, jump: Jump, repeat: bool) {
-        let y = self.cursor.y;
-        let (_top, lines) = self.delegate.get_lines(y..y + 1);
-        let target_str = jump.target.to_string();
-        if let Some(line) = lines.get(0) {
-            // Find the indices of cells with a matching target
-            let mut candidates: Vec<usize> = line
-                .visible_cells()
-                .filter_map(|cell| {
-                    if cell.str() == &target_str {
-                        Some(cell.cell_index())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if !jump.forward {
-                candidates.reverse();
-            }
-
-            // Adjust cursor cutoff so that we don't end up matching
-            // the current cursor position for the prev_char cases
-            let cursor_x = match (jump.prev_char && repeat, jump.forward) {
-                (false, _) => self.cursor.x,
-                (true, true) => self.cursor.x.saturating_add(1),
-                (true, false) => self.cursor.x.saturating_sub(1),
-            };
-
-            // Find the target that matches the jump
-            let target = candidates
-                .iter()
-                .find(|&&idx| {
-                    if jump.forward {
-                        idx > cursor_x
-                    } else {
-                        idx < cursor_x
-                    }
-                })
-                .copied();
-
-            if let Some(target) = target {
-                // We'll select the target cell index, or the cell
-                // before/after depending on the prev_char and direction
-                let target = match (jump.prev_char, jump.forward) {
-                    (false, true | false) => target,
-                    (true, true) => target.saturating_sub(1),
-                    (true, false) => target.saturating_add(1),
-                };
-
-                self.cursor.x = target;
-                self.select_to_cursor_pos();
-            }
+    /// The rows that a jump looks at: from the cursor to 99 rows past the
+    /// edge of the screen, in the direction of the jump (as vim-sneak does).
+    fn sneak_scope(&self, forward: bool, from_y: StableRowIndex) -> Range<StableRowIndex> {
+        let dims = self.delegate.get_dimensions();
+        let top = self.viewport.unwrap_or(dims.physical_top);
+        let end = dims.scrollback_top + dims.scrollback_rows as isize;
+        if forward {
+            from_y..(top + dims.viewport_rows as isize + 99).min(end).max(from_y + 1)
+        } else {
+            (top - 99).max(dims.scrollback_top).min(from_y)..from_y + 1
         }
     }
 
-    fn jump(&mut self, forward: bool, prev_char: bool) {
-        self.pending_jump
-            .replace(PendingJump { forward, prev_char });
+    /// The matches of `target` after (forward) or before `from`, nearest
+    /// first: (row, first cell, width in cells). Smart case: a target with
+    /// an upper case letter matches only that case.
+    fn sneak_find(&self, target: &str, forward: bool, from: (StableRowIndex, usize)) -> Vec<(StableRowIndex, usize, usize)> {
+        let want: Vec<String> = target.chars().map(|c| c.to_string()).collect();
+        if want.is_empty() { return vec![]; }
+        let fold = !target.chars().any(|c| c.is_uppercase());
+        let same = |cell: &str, want: &str| if fold { cell.to_lowercase() == want.to_lowercase() } else { cell == want };
+        let rows = self.sneak_scope(forward, from.0);
+        let (first_row, lines) = self.delegate.get_lines(rows);
+        let mut found = vec![];
+        for (i, line) in lines.iter().enumerate() {
+            let y = first_row + i as StableRowIndex;
+            let cells: Vec<(usize, String, usize)> = line.visible_cells()
+                .map(|c| (c.cell_index(), c.str().to_owned(), c.width().max(1))).collect();
+            for k in 0..cells.len() {
+                if k + want.len() > cells.len() { break; }
+                if !(0..want.len()).all(|j| same(&cells[k + j].1, &want[j])) { continue; }
+                let x = cells[k].0;
+                let last = &cells[k + want.len() - 1];
+                let width = last.0 + last.2 - x;
+                let beyond = if forward { (y, x) > from } else { (y, x) < from };
+                if beyond { found.push((y, x, width)); }
+            }
+        }
+        if !forward { found.reverse(); }
+        found
+    }
+
+    fn sneak_mark(&mut self, y: StableRowIndex, cells: Range<usize>, label: Option<char>) {
+        self.dirty_results.add(y);
+        self.sneak_marks.entry(y).or_default().push((cells, label));
+    }
+
+    /// Take away the jump highlights and labels.
+    fn sneak_clear(&mut self) {
+        if self.sneak_marks.is_empty() && self.sneak_labels.is_empty() { return; }
+        for y in self.sneak_marks.keys() { self.dirty_results.add(*y); }
+        self.sneak_marks.clear();
+        self.sneak_labels.clear();
+        self.sneak_rest.clear();
+        self.window.invalidate();
+    }
+
+    /// Label mode: a label on each match on the screen after the cursor.
+    fn sneak_place_labels(&mut self) {
+        let dims = self.delegate.get_dimensions();
+        let top = self.viewport.unwrap_or(dims.physical_top);
+        let bottom = top + dims.viewport_rows as isize;
+        let labels: Vec<char> = SNEAK_LABELS.chars().collect();
+        let rest = std::mem::take(&mut self.sneak_rest);
+        let mut placed = 0;
+        for (n, &(y, x, _width)) in rest.iter().enumerate() {
+            if y < top || y >= bottom { break; }
+            if n >= labels.len() { break; }
+            self.sneak_labels.push((labels[n], y, x));
+            self.sneak_mark(y, x..x + 1, Some(labels[n]));
+            placed = n + 1;
+        }
+        // Tab labels the matches after these ones.
+        self.sneak_rest = rest[placed..].to_vec();
+        self.window.invalidate();
+    }
+
+    /// Move the cursor to a jump target; in visual mode the selection follows.
+    fn sneak_move(&mut self, y: StableRowIndex, x: usize) {
+        self.cursor.y = y;
+        self.cursor.x = x;
+        self.select_to_cursor_pos();
+    }
+
+    fn perform_jump(&mut self, jump: &Jump, forward: bool, repeat: bool) {
+        let mut from = (self.cursor.y, self.cursor.x);
+        // A repeated t-like jump does not stop again before the same character.
+        if jump.prev_char && repeat {
+            if forward { from.1 += 1; } else { from.1 = from.1.saturating_sub(1); }
+        }
+        let found = self.sneak_find(&jump.target, forward, from);
+        self.sneak_clear();
+        self.sneak_active = true;
+        let Some(&(y, x, width)) = found.first() else {
+            self.delegate.perform_actions(vec![termwiz::escape::Action::Control(termwiz::escape::ControlCode::Bell)]);
+            return;
+        };
+        let x = match (jump.prev_char, forward) {
+            (false, _) => x,
+            (true, true) => x.saturating_sub(1),
+            (true, false) => x + width,
+        };
+        self.sneak_move(y, x);
+        // A match of two characters shows where the cursor is.
+        if jump.target.chars().count() > 1 { self.sneak_mark(y, x..x + width, None); }
+        self.sneak_rest = found[1..].to_vec();
+        let dims = self.delegate.get_dimensions();
+        let top = self.viewport.unwrap_or(dims.physical_top);
+        let on_screen = |y: StableRowIndex| y >= top && y < top + dims.viewport_rows as isize;
+        // A first two-character jump with more matches on the screen: labels.
+        if jump.label && !repeat && self.sneak_rest.first().is_some_and(|m| on_screen(m.0)) {
+            self.sneak_place_labels();
+        } else {
+            for (y, x, width) in std::mem::take(&mut self.sneak_rest) { self.sneak_mark(y, x..x + width, None); }
+        }
+        self.window.invalidate();
+    }
+
+    /// f, F, t, T: ask for the target; right after a jump of the same kind, go
+    /// to the next match instead (clever-f). As in vim-sneak with
+    /// sneak#s_next, the key of the first jump goes on in its direction and
+    /// the other key goes back.
+    fn jump(&mut self, forward: bool, prev_char: bool, label: bool) {
+        if self.sneak_active {
+            if let Some(last) = self.last_jump.clone() {
+                if last.prev_char == prev_char && last.label == label {
+                    self.perform_jump(&last, last.forward == forward, true);
+                    return;
+                }
+            }
+        }
+        self.sneak_clear();
+        self.sneak_active = false;
+        self.pending_jump.replace(PendingJump { forward, prev_char, label, typed: String::new() });
     }
 
     fn jump_again(&mut self, reverse: bool) {
-        if let Some(mut jump) = self.last_jump {
-            if reverse {
-                jump.forward = !jump.forward;
-            }
-            self.perform_jump(jump, true);
+        if let Some(jump) = self.last_jump.clone() {
+            self.perform_jump(&jump, jump.forward != reverse, true);
         }
+    }
+
+    /// A key while the labels show: a label jumps there; Tab labels the
+    /// next matches; Escape or Space ends; any other key ends and does
+    /// what it does. Returns the assignment of that other key.
+    fn sneak_label_key(&mut self, key: KeyCode, mods: KeyModifiers) -> Option<KeyAssignment> {
+        let deferred = self.sneak_deferred.take();
+        let plain = mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT;
+        match key {
+            KeyCode::Char(c) if plain && (c == ':' || self.sneak_labels.iter().any(|l| l.0 == c)) => {
+                let target = if c == ':' { self.sneak_labels.first() } else { self.sneak_labels.iter().find(|l| l.0 == c) };
+                if let Some(&(_, y, x)) = target {
+                    self.sneak_clear();
+                    self.sneak_active = false;
+                    self.sneak_move(y, x);
+                }
+                None
+            }
+            KeyCode::Tab | KeyCode::Char('\t') if mods == KeyModifiers::NONE => {
+                match self.sneak_rest.first().copied() {
+                    Some((y, x, _)) => {
+                        let rest = self.sneak_rest[1..].to_vec();
+                        self.sneak_clear();
+                        self.sneak_move(y, x);
+                        self.sneak_rest = rest;
+                        self.sneak_place_labels();
+                    }
+                    None => { self.sneak_clear(); self.sneak_active = false; }
+                }
+                None
+            }
+            KeyCode::Escape | KeyCode::Char(' ') | KeyCode::Char('\u{1b}') => {
+                self.sneak_clear();
+                self.sneak_active = false;
+                None
+            }
+            _ => {
+                self.sneak_clear();
+                self.sneak_active = false;
+                deferred
+            }
+        }
+    }
+
+    /// The pane takes the next keys itself (the target of f/t, a label).
+    pub fn captures_keys(&self) -> bool {
+        self.pending_jump.is_some() || !self.sneak_labels.is_empty()
     }
 
     fn set_selection_mode(&mut self, mode: &Option<SelectionMode>) {
@@ -1503,24 +1673,47 @@ impl Pane for CopyOverlay {
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         let mut render = self.render.lock();
         let mods = mods.remove_positional_mods();
-        if let Some(jump) = render.pending_jump.take() {
+        // Shift (for F, T or an upper case target) comes as a key of its own:
+        // it must not end a jump that waits for its target or a label.
+        if key.is_modifier() && (render.pending_jump.is_some() || !render.sneak_labels.is_empty()) {
+            return Ok(());
+        }
+        if !render.sneak_labels.is_empty() {
+            if let Some(assignment) = render.sneak_label_key(key, mods) {
+                // The key that ended label mode does what it does.
+                let pane_id = self.delegate.pane_id();
+                render.window.notify(TermWindowNotif::PerformAssignment { pane_id, assignment, tx: None });
+            }
+            return Ok(());
+        }
+        if let Some(mut pending) = render.pending_jump.take() {
+            let mut target = None;
             match (key, mods) {
                 (KeyCode::Char(c), KeyModifiers::NONE)
-                | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
-                    let jump = Jump {
-                        forward: jump.forward,
-                        prev_char: jump.prev_char,
-                        target: c,
-                    };
-                    render.last_jump.replace(jump);
-                    render.perform_jump(jump, false);
+                | (KeyCode::Char(c), KeyModifiers::SHIFT) if c != '\u{1b}' && c != '\r' && c != '\t' && c != '\u{8}' && c != '\u{7f}' => {
+                    pending.typed.push(c);
+                    if pending.typed.chars().count() >= if pending.label { 2 } else { 1 } {
+                        target = Some(pending.typed.clone());
+                    } else {
+                        render.pending_jump = Some(pending.clone());
+                    }
                 }
+                // Enter: the characters typed so far, or the last target.
+                (KeyCode::Enter, _) | (KeyCode::Char('\r'), _) => {
+                    target = if pending.typed.is_empty() { render.last_jump.as_ref().map(|j| j.target.clone()) } else { Some(pending.typed.clone()) };
+                }
+                (KeyCode::Escape, _) | (KeyCode::Char('\u{1b}'), _) | (KeyCode::Backspace, _) | (KeyCode::Char('C'), KeyModifiers::CTRL) | (KeyCode::Char('c'), KeyModifiers::CTRL) => {}
                 _ => {
                     self.delegate
                         .perform_actions(vec![termwiz::escape::Action::Control(
                             termwiz::escape::ControlCode::Bell,
                         )]);
                 }
+            }
+            if let Some(target) = target {
+                let jump = Jump { forward: pending.forward, prev_char: pending.prev_char, label: pending.label, target };
+                render.last_jump.replace(jump.clone());
+                render.perform_jump(&jump, jump.forward, false);
             }
             return Ok(());
         }
@@ -1614,8 +1807,19 @@ impl Pane for CopyOverlay {
             // and resolves the next state
             return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
         }
+        if !render.sneak_labels.is_empty() {
+            // A label or another key: key_down decides, and does this
+            // assignment when the key is not a label.
+            render.sneak_deferred = Some(assignment.clone());
+            return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
+        }
         match assignment {
             KeyAssignment::CopyMode(assignment) => {
+                if !matches!(assignment, JumpForward{..} | JumpBackward{..} | JumpAgain | JumpReverse | Sneak{..}) {
+                    // Another motion ends the jump: its highlights go.
+                    render.sneak_clear();
+                    render.sneak_active = false;
+                }
                 if !matches!(assignment, HighlightCommands(_) | CommandSelection(_) | SelectCommand{..} | SetSelectionMode(_) | ClearSelectionMode) {
                     render.set_command_highlight(false);
                 }
@@ -1672,6 +1876,7 @@ impl Pane for CopyOverlay {
                     HighlightCommands(enabled) => render.set_command_highlight(*enabled),
                     SearchHistory(direction) => render.search_history(*direction),
                     ScrollByLine(amount) => render.scroll_by_line(*amount),
+                    ScrollViewport(amount) => render.scroll_viewport(*amount),
                     AcceptPattern => render.accept_pattern(),
                     SetSelectionMode(mode) => render.set_selection_mode(mode),
                     ClearSelectionMode => render.clear_selection_mode(),
@@ -1679,8 +1884,9 @@ impl Pane for CopyOverlay {
                     MoveForwardSemanticZone => render.move_by_zone(1, None),
                     MoveBackwardZoneOfType(zone_type) => render.move_by_zone(-1, Some(*zone_type)),
                     MoveForwardZoneOfType(zone_type) => render.move_by_zone(1, Some(*zone_type)),
-                    JumpForward { prev_char } => render.jump(true, *prev_char),
-                    JumpBackward { prev_char } => render.jump(false, *prev_char),
+                    JumpForward { prev_char } => render.jump(true, *prev_char, false),
+                    JumpBackward { prev_char } => render.jump(false, *prev_char, false),
+                    Sneak { forward } => render.jump(*forward, false, true),
                     JumpAgain => render.jump_again(false),
                     JumpReverse => render.jump_again(true),
                 }
@@ -1883,6 +2089,9 @@ impl Pane for CopyOverlay {
                         }
                         line.clear_appdata();
                     }
+                    if let Some(marks) = self.renderer.sneak_marks.get(&stable_idx) {
+                        draw_sneak_marks(&mut line, marks);
+                    }
                     overlay_lines.push(line);
                 }
 
@@ -1960,6 +2169,9 @@ impl Pane for CopyOverlay {
                     }
                 }
             }
+            if let Some(marks) = renderer.sneak_marks.get(&stable_idx) {
+                draw_sneak_marks(line, marks);
+            }
         }
 
         (top, lines)
@@ -1968,6 +2180,27 @@ impl Pane for CopyOverlay {
     fn get_dimensions(&self) -> RenderableDimensions {
         self.delegate.get_dimensions()
     }
+}
+
+/// The jump highlights of vim-sneak (SneakLabel in red, bold, underlined),
+/// and the labels in place of the first character of their match.
+fn draw_sneak_marks(line: &mut Line, marks: &[(Range<usize>, Option<char>)]) {
+    for (cells, label) in marks {
+        for idx in cells.clone() {
+            let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(idx) else { continue };
+            cell.attrs_mut()
+                .set_foreground(AnsiColor::Maroon)
+                .set_intensity(termwiz::cell::Intensity::Bold)
+                .set_underline(termwiz::cell::Underline::Single)
+                .set_reverse(false);
+        }
+        if let Some(label) = label {
+            if let Some(attrs) = line.get_cell(cells.start).map(|c| c.attrs().clone()) {
+                line.set_cell(cells.start, Cell::new(*label, attrs), SEQ_ZERO);
+            }
+        }
+    }
+    line.clear_appdata();
 }
 
 pub struct SearchOverlayPatternWriter {

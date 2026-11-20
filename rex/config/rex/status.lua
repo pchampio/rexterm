@@ -330,16 +330,28 @@ function M.apply(config, wezterm, module_dir)
   local title_cache={}
   local title_started={}
   local shell_title=(os.getenv("SHELL") or "/bin/zsh"):match("([^/]+)$")
+  -- A pane's age is kept by its Rex block: after a session switch or a
+  -- reattach the new pane of a known block is not "new" again (its tile
+  -- comes from the program it runs, not the shell tile of a starting pane).
+  local function age_key(pane)
+    local block=(pane.user_vars or {}).WEZTERM_REX_BLOCK
+    return (block and block~='') and block or pane.pane_id
+  end
   wezterm.on('format-tab-title-compact', function(tab, _, _, _, max_width)
     local all, unread, best = read(), 0, {state='idle', text=''}
     local now=os.time()
+    -- One status drawing for each pane that has one (each agent of the tab),
+    -- in the order of the panes.
+    local marks={}
     for _, pane in ipairs(tab.panes or {}) do
       -- Age every pane, including inactive splits. A tab can be hours old
       -- when its newly focused shell starts running initialization helpers.
-      title_started[pane.pane_id]=title_started[pane.pane_id] or now
+      title_started[age_key(pane)]=title_started[age_key(pane)] or now
       local s = all[tostring(pane.pane_id)] or summarize(wezterm, pane.user_vars or {})
       unread = unread + (s.unread or 0)
       if rank[s.state] > rank[best.state] then best = s end
+      local m=indicator(s)
+      if m and #marks<4 then marks[#marks+1]=m end
     end
     local title = tab.tab_title
     if title == '' or title:match('^Window %x+$') then
@@ -350,7 +362,7 @@ function M.apply(config, wezterm, module_dir)
       -- hook runs (git, pgrep). OSC 133 marks give WEZTERM_AT_PROMPT.
       if vars.WEZTERM_AT_PROMPT=='1' then process_title=shell_title end
       title=process_title or pane.title or shell_title
-      local id=pane.pane_id or ('tab:'..tostring(tab.tab_id or tab.tab_index))
+      local id=pane.pane_id and age_key(pane) or ('tab:'..tostring(tab.tab_id or tab.tab_index))
       title_started[id]=title_started[id] or now
       -- Shell initialization briefly exposes helpers as the foreground job.
       -- Keep the initial label stable; explicit tab names always win.
@@ -359,10 +371,12 @@ function M.apply(config, wezterm, module_dir)
     end
     -- The status is a small drawing, not a word: dots that move while an
     -- agent works, a "?" bubble while it waits for an answer, and so on.
-    local mark=indicator(best)
+    local mark=marks[1]
     -- The unread count only shows when no drawing says it already.
     local suffix = (unread > 0 and not mark) and (' [' .. tostring(unread) .. ']') or ''
-    local mark_text=mark and ('\27]7778;status;'..mark..';2\7') or ''
+    local parts={}
+    for i,m in ipairs(marks) do parts[i]='\27]7778;status;'..m..';2\7' end
+    local mark_text=table.concat(parts,' ')
     local progress=best.text:match('%d+%%$')
     if progress then suffix=suffix..' '..progress end
     -- The program tiles of the tab stand where the tab number was: the
@@ -376,7 +390,7 @@ function M.apply(config, wezterm, module_dir)
         local vars=pane.user_vars or {}
         local ok,process=pcall(wezterm.json_parse,vars.WEZTERM_REX_PROCESS or 'null')
         local slug
-        if now-(title_started[pane.pane_id] or now)<2 or vars.WEZTERM_AT_PROMPT=='1' then slug='shell'
+        if now-(title_started[age_key(pane)] or now)<2 or vars.WEZTERM_AT_PROMPT=='1' then slug='shell'
         elseif ok and type(process)=='table' then
           slug=icons.slug(program_name(process) or process.path)
           -- A script (node, python) shows its own tile when it has one.
@@ -397,7 +411,7 @@ function M.apply(config, wezterm, module_dir)
       prefix_cells=icons.width(#slugs)
       prefix=icons.cells(slugs,prefix_cells)
     end
-    local budget = math.max(0, max_width - prefix_cells - wezterm.column_width(suffix .. '   ') - (mark and 3 or 0))
+    local budget = math.max(0, max_width - prefix_cells - wezterm.column_width(suffix .. '   ') - 3*#marks)
     local cache_key=(tab.is_active and 'active' or 'inactive')..'\0'..prefix..title..suffix..mark_text..'\0'..max_width
     local cached=title_cache[tab.tab_id or tab.tab_index]
     if cached and cached.key==cache_key then return cached.text end

@@ -60,11 +60,18 @@ struct State {
     agent_popups: HashMap<String, String>,
     /// Popups that were opened and not laid out yet: they take the focus.
     agent_popups_new: HashSet<String>,
+    /// The open agent popups of the other sessions, by session: they open
+    /// again (with the focus) when you switch back to that session.
+    agent_popups_parked: HashMap<String, HashMap<String, String>>,
     /// Agent shells with a live terminal for the agent panel (no layout).
     agent_watch: HashSet<String>,
     /// The command and exit status (None while it runs) of each agent shell,
     /// for the popup title.
     agent_info: HashMap<String, (String, Option<i64>)>,
+    /// The server windows in tab order and the active one, as the GUI showed
+    /// them after the last view: a closed active tab goes to its left neighbor.
+    tab_order: Vec<String>,
+    active_tab_window: Option<String>,
 }
 
 /// The frame of an agent shell popup: the command, its state, and the keys.
@@ -76,12 +83,28 @@ fn agent_popup_frame(info: Option<&(String, Option<i64>)>) -> PopupFrame {
     // The state and the keys in the title; the command on its own line under
     // it, which stays when the terminal scrolls.
     let title = match info.and_then(|(_, code)| *code) {
-        None => "#[align=centre,fg=colour0,bg=colour248] running  ·  Esc hides  ·  prefix x stops ".to_owned(),
-        Some(0) => "#[align=centre,fg=colour0,bg=colour2] finished  ·  Esc hides ".to_owned(),
-        Some(code) => format!("#[align=centre,fg=colour7,bg=colour1] finished, exit {code}  ·  Esc hides "),
+        None => "#[align=centre,fg=colour0,bg=colour248] running  ·  Esc/q hides  ·  prefix x stops ".to_owned(),
+        Some(0) => "#[align=centre,fg=colour0,bg=colour2] finished  ·  Esc/q hides ".to_owned(),
+        Some(code) => format!("#[align=centre,fg=colour7,bg=colour1] finished, exit {code}  ·  Esc/q hides "),
     };
     let subtitle = if command.is_empty() { String::new() } else { format!("$ {command}") };
     PopupFrame { title, border_style, subtitle }
+}
+
+/// The user variables that pick a tab's program tile, by Rex block. A pane
+/// made again for the same block (a session switch, a reattach) starts with
+/// them, so its tab shows the right tile before the server answers.
+const REMEMBERED_VARS: [&str; 2] = ["WEZTERM_REX_PROCESS", "WEZTERM_AT_PROMPT"];
+fn remembered_vars() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    static VARS: std::sync::OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = std::sync::OnceLock::new();
+    VARS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn remember_var(endpoint: &str, block: &str, name: &str, value: &str) {
+    if !REMEMBERED_VARS.contains(&name) { return; }
+    let mut all = remembered_vars().lock();
+    // A bound on the memory: drop it all now and then (it fills again).
+    if all.len() > 4096 { all.clear(); }
+    all.entry(format!("{endpoint}|{block}")).or_default().insert(name.to_owned(), value.to_owned());
 }
 
 /// The label of a detached block that bin/rex-agent-shell made:
@@ -276,6 +299,15 @@ impl RexDomain {
     }
     /// Show an agent shell in a popup of the window that holds `window`.
     async fn show_agent_shell(&self, block: String, window: String) -> Result<()> {
+        self.open_agent_popup(block, window).await?;
+        self.relayout().await
+    }
+    /// Make the popup of an agent shell (the next layout shows it, with the
+    /// focus).
+    async fn open_agent_popup(&self, block: String, window: String) -> Result<()> {
+        // A view applied meanwhile would drop the new pane: it is not a popup
+        // yet when that view ends.
+        let _applying = self.applying.lock().await;
         let (client, session) = self.connection()?;
         if !self.state.lock().panes.contains_key(&block) {
             let pane = RexPane::new(self.id, client.clone(), self.config.endpoint.clone(), session.clone(),
@@ -296,7 +328,7 @@ impl RexDomain {
             state.agent_popups.insert(block.clone(), window);
             state.agent_popups_new.insert(block);
         }
-        self.relayout().await
+        Ok(())
     }
     /// Take the popup away. The command keeps running on the server.
     async fn hide_agent_shell(&self, block: &str) -> Result<()> {
@@ -352,6 +384,39 @@ impl RexDomain {
         let mux = Mux::get();
         let window = self.state.lock().window.context("no GUI window")?;
         let previous_active=if self.config.independent {mux.get_window(window).and_then(|w|w.get_active_tab().map(|t|t.tab_id()))}else{None};
+        // The tab order and the active tab before this view (the GUI may have
+        // changed tabs since the last view).
+        let (order_before, active_before) = {
+            let mut state = self.state.lock();
+            let by_tab: HashMap<TabId, String> = state.tabs.iter().map(|(w, t)| (*t, w.clone())).collect();
+            if let Some(win) = mux.get_window(window) {
+                let order: Vec<String> = win.iter_tabs().filter_map(|t| by_tab.get(&t.tab_id()).cloned()).collect();
+                let active = win.get_active_tab().and_then(|t| by_tab.get(&t.tab_id()).cloned());
+                if active.is_some() { state.tab_order = order; state.active_tab_window = active; }
+            }
+            (state.tab_order.clone(), state.active_tab_window.clone())
+        };
+        // The active tab closed: the tab on its left gets the focus (the
+        // first tab when the first one closed), not the server's choice.
+        let closed_fallback = active_before.as_ref().and_then(|active| {
+            let present = |id: &String| view["windows"].as_array().into_iter().flatten().any(|w| w["window_id"] == id.as_str());
+            if present(active) { return None; }
+            // A block of the closed tab moved to the server's active tab (join
+            // a pane into another tab): follow it.
+            let blocks = |win: &Value| -> HashSet<String> {
+                win["layers"].as_array().into_iter().flatten()
+                    .flat_map(|l| l["blocks"].as_array().into_iter().flatten())
+                    .filter_map(|b| b["block_id"].as_str().map(str::to_owned)).collect()
+            };
+            let old_view = self.state.lock().view.clone();
+            let closed = old_view["windows"].as_array().into_iter().flatten()
+                .find(|w| w["window_id"] == active.as_str()).map(|w| blocks(w)).unwrap_or_default();
+            let server_active = view["windows"].as_array().into_iter().flatten()
+                .find(|w| w["window_id"] == view["active_window_id"]).map(|w| blocks(w)).unwrap_or_default();
+            if !closed.is_disjoint(&server_active) { return None; }
+            let index = order_before.iter().position(|w| w == active)?;
+            order_before[..index].iter().rev().chain(order_before[index + 1..].iter()).find(|w| present(w)).cloned()
+        });
         // Open every new terminal before changing any visible tab. A block can
         // disappear while this snapshot is being fetched (e.g. the temporary
         // anchor used by break-pane). Failed preparation must leave the GUI's
@@ -549,6 +614,10 @@ impl RexDomain {
         }
         let (removed_tabs, removed_panes) = {
             let mut s = self.state.lock();
+            // An agent popup or preview opened while this view was applied
+            // (after live_panes was made) keeps its pane.
+            live_panes.extend(s.agent_popups.keys().cloned());
+            live_panes.extend(s.agent_watch.iter().cloned());
             let tabs = s
                 .tabs
                 .iter()
@@ -590,7 +659,22 @@ impl RexDomain {
                 }
             }
         }
-        if let Some(active) = previous_active.filter(|id|mux.get_tab(*id).is_some()).or_else(|| view["active_window_id"]
+        let fallback_tab = closed_fallback.as_ref().and_then(|id| self.state.lock().tabs.get(id).copied());
+        if let (Some(id), Some(_)) = (&closed_fallback, fallback_tab) {
+            if view["active_window_id"].as_str() != Some(id.as_str()) {
+                // Tell the server, so that its next view keeps this tab.
+                let block = view["windows"].as_array().into_iter().flatten()
+                    .find(|w| w["window_id"] == id.as_str())
+                    .and_then(|w| w["focused_block_id"].as_str()).map(str::to_owned);
+                log::debug!("closed tab: focus the tab on its left {id} block {block:?}");
+                if let Some(block) = block {
+                    if let Err(error) = client.call("session.focus_block", json!({"session_id":session,"block_id":block})).await {
+                        log::debug!("focus the tab on the left of a closed tab: {error:#}");
+                    }
+                }
+            }
+        }
+        if let Some(active) = fallback_tab.or_else(|| previous_active.filter(|id|mux.get_tab(*id).is_some())).or_else(|| view["active_window_id"]
             .as_str()
             .and_then(|id| self.state.lock().tabs.get(id).copied()))
         {
@@ -605,6 +689,14 @@ impl RexDomain {
             .and_then(|w| w.get_active_tab().cloned())
             .and_then(|t| t.get_active_pane())
             .map(|p| p.pane_id());
+        {
+            let mut state = self.state.lock();
+            let by_tab: HashMap<TabId, String> = state.tabs.iter().map(|(w, t)| (*t, w.clone())).collect();
+            if let Some(win) = mux.get_window(window) {
+                state.tab_order = win.iter_tabs().filter_map(|t| by_tab.get(&t.tab_id()).cloned()).collect();
+                state.active_tab_window = win.get_active_tab().and_then(|t| by_tab.get(&t.tab_id()).cloned());
+            }
+        }
         log::debug!("committed Rex view {} focus {:?} preparation_ms={}",revision,self.state.lock().focused_pane,started.elapsed().as_millis());
         mux.notify(MuxNotification::WindowInvalidated(window));
         Ok(())
@@ -647,12 +739,32 @@ impl RexDomain {
                 return Err(error);
             }
         };
-        {
+        let reopen = {
             let mut state = self.state.lock();
-            state.session = session;
+            // The open agent popups stay with their session: their panes go
+            // with the session's other panes, and come back with it.
+            let open = std::mem::take(&mut state.agent_popups);
+            state.agent_popups_new.clear();
+            // Panel previews of the old session go too (the panel asks again).
+            state.agent_watch.clear();
+            if !open.is_empty() { state.agent_popups_parked.insert(previous.clone(), open); }
+            state.session = session.clone();
             state.revision = None;
-        }
+            let reopen = state.agent_popups_parked.remove(&session).unwrap_or_default();
+            log::debug!("Rex session switch {previous} -> {session}: parked {} popups, reopening {}",
+                state.agent_popups_parked.get(&previous).map_or(0, |p| p.len()), reopen.len());
+            reopen
+        };
         self.apply_view(response["view"].clone()).await?;
+        if !reopen.is_empty() {
+            for (block, window) in reopen {
+                // The command may have ended and its terminal closed meanwhile.
+                if let Err(error) = self.open_agent_popup(block, window).await {
+                    log::debug!("Rex agent popup not opened again: {error:#}");
+                }
+            }
+            self.relayout().await?;
+        }
         client
             .call("session.detach", json!({"session_id":previous}))
             .await?;
@@ -1275,8 +1387,12 @@ impl RexPane {
     ) -> Result<Arc<Self>> {
         let buffer_key = format!("{}:{}", endpoint, session);
         let id = alloc_pane_id();
-        let vars = Arc::new(Mutex::new(HashMap::new()));
+        let mut known = remembered_vars().lock().get(&format!("{endpoint}|{block}")).cloned().unwrap_or_default();
+        // The block ID lets the tab title code know a pane again.
+        known.insert("WEZTERM_REX_BLOCK".to_owned(), block.clone());
+        let vars = Arc::new(Mutex::new(known));
         let v = vars.clone();
+        let (var_endpoint, var_block) = (endpoint.clone(), block.clone());
         let palette: ColorPalette = config::configuration().resolved_palette.clone().into();
         let theme=json!({"session_id":session,"block_id":block,"args":{
             "foreground":palette.foreground.to_rgb_string(),"background":palette.background.to_rgb_string(),"cursor":palette.cursor_bg.to_rgb_string(),
@@ -1301,7 +1417,10 @@ impl RexPane {
                     // removals on prompt/exit. A delayed output packet must
                     // not overwrite a newer control event with a local copy.
                     if matches!(&alert,Alert::SetUserVar{name,..} if name=="WEZTERM_PROGRAM_STATUS") {return;}
-                    if let Alert::SetUserVar{name,value}=&alert {v.lock().insert(name.clone(),value.clone());}
+                    if let Alert::SetUserVar{name,value}=&alert {
+                        v.lock().insert(name.clone(),value.clone());
+                        remember_var(&var_endpoint,&var_block,name,value);
+                    }
                     // Rex emits authoritative notification events as well.
                     if !matches!(alert,Alert::Bell|Alert::ToastNotification{..}) {
                         Mux::notify_from_any_thread(MuxNotification::Alert{pane_id:id,alert});
@@ -1347,6 +1466,7 @@ impl RexPane {
         }))
     }
     fn publish_var(&self, name: &str, value: String) {
+        remember_var(&self.endpoint, &self.block, name, &value);
         let changed = self.vars.lock().insert(name.into(), value.clone()).as_ref() != Some(&value);
         if changed {
             Mux::notify_from_any_thread(MuxNotification::Alert {
@@ -1614,9 +1734,10 @@ impl RexPane {
     }
     fn key(&self, key: KeyCode, mods: KeyModifiers, release: bool) -> Result<()> {
         // An agent shell popup only shows the command: it takes no input.
-        // Escape hides it (the command goes on); prefix x stops it.
+        // Escape or q hides it (the command goes on); prefix x stops it.
         if self.detached.load(Ordering::Relaxed) {
-            if !release && matches!(key, KeyCode::Escape | KeyCode::Char('\u{1b}')) {
+            // q does what Escape does, as in a pager.
+            if !release && (matches!(key, KeyCode::Escape | KeyCode::Char('\u{1b}')) || (key == KeyCode::Char('q') && mods.is_empty())) {
                 let (domain, block) = (self.domain, self.block.clone());
                 promise::spawn::spawn_into_main_thread(async move {
                     let Some(domain) = Mux::get().get_domain(domain) else { return; };
@@ -1938,21 +2059,33 @@ impl Pane for RexPane {
         // A layout update can temporarily show a fallback tab while awaiting a
         // new block. Its paint is not a user focus action. Track focus once per
         // domain, and commit the server's authoritative focus after applying it.
-        // An agent shell is in no server window: the server has no focus for it.
-        if self.detached.load(Ordering::Relaxed) { return; }
         if domain.config.independent || domain.applying.try_lock().is_none() { return; }
-        {
+        let block = {
             let mut state = domain.state.lock();
             let active = state.window.and_then(|w| Mux::get().get_active_tab_for_window(w))
                 .and_then(|t| t.get_active_pane()).map(|p| p.pane_id());
             if active != Some(self.id) || state.focused_pane == Some(self.id) { return; }
-            log::debug!("Rex GUI focus {:?} -> {} block {}",state.focused_pane,self.id,self.block);
+            // An agent shell is in no server window: focus the block that has
+            // the focus in the popup's window, so that the server knows which
+            // window is active (a session switch comes back to it).
+            let block = if self.detached.load(Ordering::Relaxed) {
+                let window = self.window.lock().clone();
+                let found = state.view["windows"].as_array().into_iter().flatten()
+                    .find(|w| w["window_id"] == window.as_str())
+                    .and_then(|w| w["focused_block_id"].as_str()).map(str::to_owned);
+                let Some(block) = found else { return; };
+                block
+            } else {
+                self.block.clone()
+            };
+            log::debug!("Rex GUI focus {:?} -> {} block {}",state.focused_pane,self.id,block);
             state.focused_pane = Some(self.id);
-        }
+            block
+        };
         let i = self.input.lock();
         let _ = i.call(
             "session.focus_block",
-            json!({"session_id":i.session,"block_id":i.block}),
+            json!({"session_id":i.session,"block_id":block}),
         );
     }
 }

@@ -182,12 +182,16 @@ impl UserData for GuiWin {
         methods.add_async_method("copy_mode_state", |lua,this,pane:UserDataRef<MuxPane>| async move {
             let (tx,rx)=smol::channel::bounded(1);let id=pane.0;
             this.window.notify(TermWindowNotif::Apply(Box::new(move |window| {
-                let state=window.pane_state(id).overlay.as_ref().and_then(|o|o.pane.downcast_ref::<crate::overlay::copy::CopyOverlay>()).map(|o|o.cursor_and_selection());
+                let state=window.pane_state(id).overlay.as_ref().and_then(|o|o.pane.downcast_ref::<crate::overlay::copy::CopyOverlay>()).map(|o|(o.cursor_and_selection(),o.jump_state()));
                 tx.try_send(state).ok();
             })));
-            let Some((x,y,start,block,viewport,results,pattern,editing,commands))=rx.recv().await.map_err(mlua::Error::external)? else{return Ok(mlua::Value::Nil)};
+            let Some(((x,y,start,block,viewport,results,pattern,editing,commands),(labels,marks,jump_pending)))=rx.recv().await.map_err(mlua::Error::external)? else{return Ok(mlua::Value::Nil)};
             let result=lua.create_table()?;result.set("x",x)?;result.set("y",y)?;result.set("block",block)?;
             result.set("viewport",viewport)?;result.set("search_results",results)?;result.set("pattern",pattern)?;result.set("editing_search",editing)?;result.set("highlight_commands",commands)?;
+            // f/t: the labels on the screen, the highlighted matches, and a jump that waits for its target.
+            let jump_labels=lua.create_table()?;
+            for (label,y,x) in labels {let l=lua.create_table()?;l.set("label",label.to_string())?;l.set("y",y)?;l.set("x",x)?;jump_labels.push(l)?;}
+            result.set("jump_labels",jump_labels)?;result.set("jump_marks",marks)?;result.set("jump_pending",jump_pending)?;
             if let Some((x,y))=start {let selection=lua.create_table()?;selection.set("x",x)?;selection.set("y",y)?;result.set("start",selection)?;}
             Ok(mlua::Value::Table(result))
         });

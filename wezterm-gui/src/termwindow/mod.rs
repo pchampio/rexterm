@@ -1319,7 +1319,13 @@ impl TermWindow {
                     alert: Alert::SetUserVar { name, value },
                     pane_id,
                 } => {
+                    // The program tiles of the tabs follow these at once,
+                    // not at the next status update.
+                    let tile = matches!(name.as_str(), "WEZTERM_REX_PROCESS" | "WEZTERM_AT_PROMPT");
                     self.emit_user_var_event(pane_id, name, value);
+                    if tile {
+                        self.update_title();
+                    }
                 }
                 MuxNotification::WindowTitleChanged { .. }
                 | MuxNotification::Alert {
@@ -2795,7 +2801,7 @@ impl TermWindow {
         }
 
         if matches!(assignment, KeyAssignment::CopyMode(config::keyassignment::CopyModeAssignment::Close))
-            && pane.is::<CopyOverlay>() {
+            && pane.downcast_ref::<CopyOverlay>().is_some_and(|o| !o.captures_keys()) {
             self.cancel_overlay_for_pane(pane.pane_id());
             return Ok(PerformAssignmentResult::Handled);
         }

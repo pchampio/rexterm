@@ -842,6 +842,9 @@ pub enum CopyModeAssignment {
     SearchAgain,
     SearchReverse,
     ScrollByLine(isize),
+    /// Scroll the view; the cursor stays on its text while it is on the
+    /// screen (vim Ctrl-e and Ctrl-y).
+    ScrollViewport(isize),
     AcceptPattern,
     MoveBackwardSemanticZone,
     MoveForwardSemanticZone,
@@ -851,6 +854,9 @@ pub enum CopyModeAssignment {
     JumpBackward { prev_char: bool },
     JumpAgain,
     JumpReverse,
+    /// A jump to two characters, with labels on the other matches on the
+    /// screen (vim-sneak s).
+    Sneak { forward: bool },
 }
 
 pub type KeyTable = HashMap<(KeyCode, Modifiers), KeyTableEntry>;
