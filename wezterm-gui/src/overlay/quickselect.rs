@@ -276,6 +276,8 @@ struct QuickSelectRenderable {
     results: Vec<SearchResult>,
     by_line: HashMap<StableRowIndex, Vec<MatchResult>>,
     by_label: HashMap<String, usize>,
+    /// The URL of each hyperlink match, by its start.
+    links: HashMap<(StableRowIndex, usize), String>,
     selection: String,
 
     viewport: Option<StableRowIndex>,
@@ -345,6 +347,7 @@ impl QuickSelectOverlay {
             results: vec![],
             by_line: HashMap::new(),
             by_label: HashMap::new(),
+            links: HashMap::new(),
             dirty_results: RangeSet::default(),
             viewport,
             last_bar_pos: None,
@@ -791,6 +794,50 @@ impl Pane for QuickSelectOverlay {
 
 /// quick_select_remove_styling removes colors and text styles. Images
 /// (imgcat) are content, not styling: keep them visible in the overlay.
+/// The hyperlinks (OSC 8) of the rows in `range`: one match for each link,
+/// over the rows that it wraps on, with its URL.
+fn hyperlink_matches(pane: &Arc<dyn Pane>, range: Range<StableRowIndex>) -> Vec<(SearchResult, String)> {
+    const FIRST_ID: usize = 1 << 30;
+    let (first, lines) = pane.get_lines(range);
+    let mut found: Vec<(SearchResult, String)> = vec![];
+    let mut ids: HashMap<String, usize> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let y = first + index as StableRowIndex;
+        let cols = line.len();
+        let mut run: Option<(usize, usize, String)> = None;
+        let mut runs = vec![];
+        for cell in line.visible_cells() {
+            let uri = cell.attrs().hyperlink().map(|link| link.uri().to_string());
+            let x = cell.cell_index();
+            let end = x + cell.width().max(1);
+            match (&mut run, uri) {
+                (Some((_, run_end, run_uri)), Some(uri)) if *run_uri == uri && *run_end == x => *run_end = end,
+                (_, uri) => {
+                    if let Some(done) = run.take() { runs.push(done); }
+                    run = uri.map(|uri| (x, end, uri));
+                }
+            }
+        }
+        runs.extend(run);
+        for (start, end, uri) in runs {
+            // The link goes on from the end of the row above: the same match.
+            if start == 0 {
+                if let Some((last, last_uri)) = found.last_mut() {
+                    if *last_uri == uri && last.end_y == y - 1 && last.end_x >= cols {
+                        last.end_y = y;
+                        last.end_x = end;
+                        continue;
+                    }
+                }
+            }
+            let next = FIRST_ID + ids.len();
+            let match_id = *ids.entry(uri.clone()).or_insert(next);
+            found.push((SearchResult { start_y: y, start_x: start, end_y: y, end_x: end, match_id }, uri));
+        }
+    }
+    found
+}
+
 fn remove_styling_keep_images(line: &mut Line) {
     for cell in line.cells_mut_for_attr_changes_only().iter_mut() {
         let images = cell.attrs().images();
@@ -974,6 +1021,7 @@ impl QuickSelectRenderable {
             let pane: Arc<dyn Pane> = self.delegate.clone();
             let window = self.window.clone();
             let pattern = self.pattern.clone();
+            let hyperlinks = self.args.hyperlinks;
             let scope = self.args.scope_lines;
             let viewport = self.viewport;
             promise::spawn::spawn(async move {
@@ -983,11 +1031,23 @@ impl QuickSelectRenderable {
                 let range = top.saturating_sub(scope as StableRowIndex)
                     ..top + (dims.viewport_rows + scope) as StableRowIndex;
                 let limit = None;
-                let mut results = pane.search(pattern, range, limit).await?;
+                let mut results = pane.search(pattern, range.clone(), limit).await?;
+                let mut links = HashMap::new();
+                if hyperlinks {
+                    let found = hyperlink_matches(&pane, range);
+                    // A URL that shows as the text of its link is one match.
+                    results.retain(|r| !found.iter().any(|(l, _)| l.start_y <= r.end_y && r.start_y <= l.end_y
+                        && (l.start_y, l.start_x) < (r.end_y, r.end_x) && (r.start_y, r.start_x) < (l.end_y, l.end_x)));
+                    for (result, uri) in found {
+                        links.insert((result.start_y, result.start_x), uri);
+                        results.push(result);
+                    }
+                }
                 results.sort();
 
                 let pane_id = pane.pane_id();
                 let mut results = Some(results);
+                let mut links = Some(links);
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                     let state = term_window.pane_state(pane_id);
                     if let Some(overlay) = state.overlay.as_ref() {
@@ -996,6 +1056,7 @@ impl QuickSelectRenderable {
                         {
                             let mut r = search_overlay.renderer.lock();
                             r.results = results.take().unwrap();
+                            r.links = links.take().unwrap();
                             r.recompute_results();
                             let num_results = r.results.len();
 
@@ -1043,6 +1104,7 @@ impl QuickSelectRenderable {
 
     fn select_and_copy_match_number(&mut self, n: usize, paste: bool) {
         let result = self.results[n].clone();
+        let link = self.links.get(&(result.start_y, result.start_x)).cloned();
 
         let pane_id = self.delegate.pane_id();
         let action = self.args.action.clone();
@@ -1072,7 +1134,14 @@ impl QuickSelectRenderable {
                     }
 
                     let text = term_window.selection_text(&pane);
-                    if !text.is_empty() {
+                    if let Some(link) = link {
+                        // A hyperlink: its URL, not its text (paste puts the URL too).
+                        if paste {
+                            let _ = pane.send_paste(&link);
+                        } else {
+                            term_window.open_link(&pane, link);
+                        }
+                    } else if !text.is_empty() {
                         if paste {
                             let _ = pane.send_paste(&text);
                         }

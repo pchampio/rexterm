@@ -3496,6 +3496,12 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
+            self.open_link(pane, link.uri().to_string());
+        }
+    }
+    /// Open a link as a click on it does (the `open-uri` event can take it).
+    pub fn open_link(&self, pane: &Arc<dyn Pane>, link: String) {
+        {
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
 
@@ -3525,7 +3531,7 @@ impl TermWindow {
             }
 
             promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                open_uri(lua, window, pane, link.uri().to_string())
+                open_uri(lua, window, pane, link)
             }))
             .detach();
         }

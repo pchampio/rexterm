@@ -327,9 +327,10 @@ function M.apply(config, wezterm, module_dir)
     return enter and act.Multiple{act.ActivateCopyMode,jump} or jump
   end
   local select_command=command_jump(0,true)
-  local function open_selection(current)
-    return callback(function(w,p)
-      local text=w:get_selection_text_for_pane(p);if not text or text=='' then return end
+  -- Open FILE, FILE:LINE or FILE:LINE:COLUMN (or a file:// URL) in the
+  -- editor on the Rex host: in the nvim of the window when it has one, else
+  -- in a new split (current: in this pane).
+  local function open_path(w,p,text,current)
       local file,line,column=text:match('^(.-):(%d+):(%d+)$')
       if not file then file,line=text:match('^(.-):(%d+)$') end
       file=file or text
@@ -361,8 +362,32 @@ function M.apply(config, wezterm, module_dir)
       end end
       call(p,'session.new_split',{anchor_id=c.block_id,direction='horizontal',side='after',ratio=.5,
         layout=shell_layout(args,cwd(p),'Editor'),focus=true})
+  end
+  local function open_selection(current)
+    return callback(function(w,p)
+      local text=w:get_selection_text_for_pane(p);if not text or text=='' then return end
+      open_path(w,p,text,current)
     end)
   end
+  -- Links of a Rex pane to a file (Codex: file_opener "vscode" makes
+  -- vscode://file/PATH:LINE; file:// URLs) are files of the Rex host: they
+  -- open in its editor, not on this desktop. Other links open as usual.
+  local function file_link(uri)
+    local path=uri:match('^vscode%-insiders://file(/.*)$') or uri:match('^vscode://file(/.*)$')
+      or uri:match('^cursor://file(/.*)$') or uri:match('^windsurf://file(/.*)$')
+    if path then return (path:gsub('%%(%x%x)',function(v)return string.char(tonumber(v,16))end)) end
+    if uri:match('^file://') then
+      local file,line=uri:match('^(.-)#L(%d+)')
+      return file and file..':'..line or uri
+    end
+  end
+  wezterm.on('open-uri',function(w,p,uri)
+    local path=file_link(uri)
+    if not path or not context(p) then return end
+    local ok,error=pcall(open_path,w,p,path,false)
+    if not ok then status.message(wezterm,w,'Cannot open '..path..': '..tostring(error)) end
+    return false
+  end)
   local readline=callback(function(w,p)
     local entries={{'t','ALT','Transpose words'}, {},{'u','CTRL','Cut to start of line'},{'d','ALT','Cut next word'},
       {'w','CTRL','Cut previous word'},{'y','CTRL','Yank kill ring'},{'y','ALT','Rotate kill ring'}, {},{'.','ALT','Previous argument'}}
@@ -727,5 +752,29 @@ function M.apply(config, wezterm, module_dir)
     if text and text~='' then perform(w,p,act.CopyTo('ClipboardAndPrimarySelection'))
     else perform(w,p,click_copy) end
   end),act.CompleteSelection('PrimarySelection'))
+  -- Ctrl-click opens the link under the mouse (a URL of the text or a
+  -- hyperlink), also in a program that takes the mouse (Codex): the press
+  -- does not reach that program.
+  for i=#config.mouse_bindings,1,-1 do
+    local b=config.mouse_bindings[i];local button=b.event and (b.event.Up or b.event.Down)
+    if b.mods=='CTRL' and button and button.button=='Left' and button.streak==1 then table.remove(config.mouse_bindings,i) end
+  end
+  for _,reporting in ipairs{false,true} do
+    table.insert(config.mouse_bindings,{event={Down={streak=1,button='Left'}},mods='CTRL',mouse_reporting=reporting,action=act.Nop})
+    table.insert(config.mouse_bindings,{event={Up={streak=1,button='Left'}},mods='CTRL',mouse_reporting=reporting,action=act.OpenLinkAtMouseCursor})
+  end
+  -- Ctrl-Shift-x: the URLs of the screen get labels, and so do the
+  -- hyperlinks (Codex shows a name and keeps the URL in the link). A label
+  -- opens its URL (a file link of a Rex pane opens in the editor of the host).
+  for i=#config.keys,1,-1 do
+    local b=config.keys[i]
+    if (b.key=='x' or b.key=='X') and (b.mods=='CTRL|SHIFT' or b.mods=='SHIFT|CTRL') then table.remove(config.keys,i) end
+  end
+  table.insert(config.keys,{key='x',mods='CTRL|SHIFT',action=act.QuickSelectArgs{label='open url',hyperlinks=true,
+    patterns={[=[https?://[^\s<>"'`()\[\]{}\\]*[^\s<>"'`()\[\]{}\\.,;:!?]]=]},
+    action=callback(function(w,p)
+      local url=(w:get_selection_text_for_pane(p) or ''):gsub('[.,;:!?]+$','')
+      if url~='' then wezterm.open_with(url) end
+    end)}})
 end
 return M

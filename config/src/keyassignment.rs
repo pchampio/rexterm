@@ -461,6 +461,10 @@ pub struct QuickSelectArguments {
     /// How many lines before and how many lines after the viewport to
     /// search to produce the quickselect results
     pub scope_lines: Option<usize>,
+    /// Label the hyperlinks (OSC 8) too: their text may not show the URL.
+    /// Choosing one opens its URL (as a click on it does) instead of `action`.
+    #[dynamic(default)]
+    pub hyperlinks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
