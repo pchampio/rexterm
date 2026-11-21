@@ -19,11 +19,21 @@ pub struct CopyScroll {
     duration: Duration,
     geometry: (usize, usize, usize, usize, usize, usize),
     generation: (usize, usize, usize),
+    /// The block cursor follows its text while the view slides (Ctrl-e/y:
+    /// the cursor stays on its row of text, so its screen row changes).
+    cursor_from: f32,
+    cursor_y: Option<f32>,
 }
 
 impl CopyScroll {
     pub fn new(position: isize, geometry: (usize, usize, usize, usize, usize, usize), generation: (usize, usize, usize), now: Instant) -> Self {
-        Self { frames: VecDeque::new(), position, from: 0., started: now, duration: DURATION, geometry, generation }
+        Self { frames: VecDeque::new(), position, from: 0., started: now, duration: DURATION, geometry, generation,
+            cursor_from: 0., cursor_y: None }
+    }
+
+    /// The offset of the block cursor from its final row now (same clock as the text).
+    pub fn cursor_offset(&self, now: Instant) -> f32 {
+        eased_offset(self.cursor_from, now.saturating_duration_since(self.started), self.duration)
     }
 
     fn offset(&self, now: Instant) -> f32 {
@@ -48,14 +58,27 @@ impl CopyScroll {
         layers: &mut TripleLayerQuadAllocator, cursor_rect: Option<(f32, f32, f32, f32)>,
         selection: Option<([i64; 8], HeapQuadAllocator, HeapQuadAllocator)>, left: f32, cell_width: f32) -> anyhow::Result<bool> {
         let delta = (position - self.position) as f32 * cell_height;
+        let cursor_y = cursor_rect.map(|r| r.1);
         if self.geometry != geometry || self.generation != generation
             || delta.abs() > ((bottom-top)*0.5).max(8.*cell_height) {
             *self = Self::new(position, geometry, generation, now);
         } else if position != self.position {
             // Retarget from the currently displayed position, not from a row
             // boundary. Bursts and direction reversals must stay continuous.
+            let cursor_shown = self.cursor_offset(now);
             self.retarget(position, now, cell_height);
+            // The cursor starts where it shows and slides to its new row.
+            self.cursor_from = match (self.cursor_y, cursor_y) {
+                (Some(old), Some(new)) => cursor_shown - (new - old),
+                _ => 0.,
+            };
+        } else if cursor_y != self.cursor_y {
+            // A move without a scroll: the cursor goes there at once.
+            self.cursor_from = 0.;
         }
+        self.cursor_y = cursor_y;
+        let cursor_offset = self.cursor_offset(now);
+        let cursor_rect = cursor_rect.map(|(x0, y0, x1, y1)| (x0, y0 + cursor_offset, x1, y1 + cursor_offset));
         if self.frames.back().map(|f| f.position) == Some(position) {
             self.frames.pop_back();
         }
@@ -63,8 +86,9 @@ impl CopyScroll {
         while self.frames.len() > 32 { self.frames.pop_front(); }
         let offset = self.offset(now);
         log::debug!(target: "tmux_scroll", "position={} offset={:.2} age_ms={:.1}", position, offset, now.saturating_duration_since(self.started).as_secs_f32()*1000.);
-        if offset.abs() < 0.1 {
+        if offset.abs() < 0.1 && cursor_offset.abs() < 0.1 {
             self.from = 0.;
+            self.cursor_from = 0.;
             while self.frames.len() > 1 { self.frames.pop_front(); }
             self.frames.back().unwrap().quads.apply_y_clipped_excluding(layers, 0., f32::NEG_INFINITY, f32::INFINITY, cursor_rect);
             return Ok(false);

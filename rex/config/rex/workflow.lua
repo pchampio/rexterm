@@ -564,7 +564,8 @@ function M.apply(config, wezterm, module_dir)
   bind('i','LEADER',split('vertical'))
   bind('v','LEADER',act.ActivateCopyMode)
   bind('k','LEADER',act.Multiple{act.ActivateCopyMode,act.CopyMode('MoveUp')})
-  bind('K','LEADER',actions.b)
+  -- prefix K goes to the previous command (as tmux did); Shift-Y selects it.
+  bind('K','LEADER',command_jump(-1,true,false))
   bind('Space','LEADER',callback(function(w,p)
     local c=context(p);if c then call(p,'session.zoom_block',{block_id=c.block_id}) else perform(w,p,act.TogglePaneZoomState) end
   end))
@@ -682,6 +683,12 @@ function M.apply(config, wezterm, module_dir)
   cb(':','SHIFT',act.CopyMode('JumpAgain'));cb(':','NONE',act.CopyMode('JumpAgain'))
   -- Ctrl-e/Ctrl-y: scroll one line, the cursor stays on its text (as in vim).
   cb('e','CTRL',act.CopyMode{ScrollViewport=1});cb('y','CTRL',act.CopyMode{ScrollViewport=-1})
+  -- w b e and W B E as in vim (WORDs are runs of non-blank characters),
+  -- over several lines; in visual mode they extend the selection.
+  for _,m in ipairs{'w','b','e'} do
+    cb(m,'NONE',act.CopyMode{VimWord={motion=m,big=false}})
+    cb(m:upper(),'SHIFT',act.CopyMode{VimWord={motion=m,big=true}});cb(m:upper(),'NONE',act.CopyMode{VimWord={motion=m,big=true}})
+  end
   tables.search_mode=wezterm.gui.default_key_tables().search_mode
   for _,key in ipairs{'a','e','w','b','f','h','k'} do
     tables.search_mode[#tables.search_mode+1]={key=key,mods='CTRL',action=act.SendKey{key=key,mods='CTRL'}}

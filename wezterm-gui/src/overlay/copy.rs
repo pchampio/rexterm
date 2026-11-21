@@ -1411,6 +1411,85 @@ impl CopyRenderable {
 
     /// The rows that a jump looks at: from the cursor to 99 rows past the
     /// edge of the screen, in the direction of the jump (as vim-sneak does).
+    /// vim w, b, e, ge (W, B, E, gE when big) as vim defines them: the end of
+    /// a row is a blank, an empty row stops w, b and ge.
+    fn vim_word(&mut self, motion: &str, big: bool) {
+        let mut text = VimText::new(self.delegate.clone(), big);
+        let row = text.row(self.cursor.y);
+        let index = row.iter().rposition(|(x, _)| *x <= self.cursor.x).unwrap_or(0);
+        let mut pos = (self.cursor.y, index.min(row.len().saturating_sub(1)));
+        match motion {
+            "w" => 'w: {
+                let sclass = text.cls(pos);
+                let Some(next) = text.inc(pos) else { break 'w };
+                pos = next;
+                if sclass != 0 {
+                    while text.cls(pos) == sclass {
+                        let Some(next) = text.inc(pos) else { break 'w };
+                        pos = next;
+                    }
+                }
+                while text.cls(pos) == 0 {
+                    if pos.1 == 0 && text.empty(pos.0) { break; }
+                    let Some(next) = text.inc(pos) else { break 'w };
+                    pos = next;
+                }
+            }
+            "b" => 'b: {
+                let Some(prev) = text.dec(pos) else { break 'b };
+                pos = prev;
+                while text.cls(pos) == 0 {
+                    if pos.1 == 0 && text.empty(pos.0) { break 'b; }
+                    let Some(prev) = text.dec(pos) else { break 'b };
+                    pos = prev;
+                }
+                let c = text.cls(pos);
+                while let Some(prev) = text.dec(pos) {
+                    if text.cls(prev) != c { break; }
+                    pos = prev;
+                }
+            }
+            "e" => 'e: {
+                let sclass = text.cls(pos);
+                let Some(next) = text.inc(pos) else { break 'e };
+                pos = next;
+                if !(text.cls(pos) == sclass && sclass != 0) {
+                    while text.cls(pos) == 0 {
+                        let Some(next) = text.inc(pos) else { break 'e };
+                        pos = next;
+                    }
+                }
+                let c = text.cls(pos);
+                while let Some(next) = text.inc(pos) {
+                    if text.cls(next) != c { break; }
+                    pos = next;
+                }
+            }
+            "ge" => 'g: {
+                // vim bckend_word: back to the end of the previous word.
+                let sclass = text.cls(pos);
+                let Some(prev) = text.dec(pos) else { break 'g };
+                pos = prev;
+                if sclass != 0 {
+                    while text.cls(pos) == sclass {
+                        let Some(prev) = text.dec(pos) else { break 'g };
+                        pos = prev;
+                    }
+                }
+                while text.cls(pos) == 0 {
+                    if pos.1 == 0 && text.empty(pos.0) { break; }
+                    let Some(prev) = text.dec(pos) else { break 'g };
+                    pos = prev;
+                }
+            }
+            _ => return,
+        }
+        let x = text.row(pos.0).get(pos.1).map_or(0, |(x, _)| *x);
+        self.cursor.y = pos.0;
+        self.cursor.x = x;
+        self.select_to_cursor_pos();
+    }
+
     fn sneak_scope(&self, forward: bool, from_y: StableRowIndex) -> Range<StableRowIndex> {
         let dims = self.delegate.get_dimensions();
         let top = self.viewport.unwrap_or(dims.physical_top);
@@ -1887,6 +1966,7 @@ impl Pane for CopyOverlay {
                     JumpForward { prev_char } => render.jump(true, *prev_char, false),
                     JumpBackward { prev_char } => render.jump(false, *prev_char, false),
                     Sneak { forward } => render.jump(*forward, false, true),
+                    VimWord { motion, big } => render.vim_word(motion, *big),
                     JumpAgain => render.jump_again(false),
                     JumpReverse => render.jump_again(true),
                 }
@@ -2184,6 +2264,66 @@ impl Pane for CopyOverlay {
 
 /// The jump highlights of vim-sneak (SneakLabel in red, bold, underlined),
 /// and the labels in place of the first character of their match.
+/// The text of a pane as vim sees it for its word motions: each row is its
+/// cells (column, first char), then '\n' after the text of a row that does
+/// not wrap (trailing blanks are padding: a blank row is an empty line).
+struct VimText {
+    pane: Arc<dyn Pane>,
+    rows: HashMap<StableRowIndex, Vec<(usize, char)>>,
+    top: StableRowIndex,
+    bottom: StableRowIndex,
+    big: bool,
+}
+
+impl VimText {
+    fn new(pane: Arc<dyn Pane>, big: bool) -> Self {
+        let dims = pane.get_dimensions();
+        let top = dims.scrollback_top;
+        let bottom = dims.scrollback_top + dims.scrollback_rows as StableRowIndex;
+        Self { pane, rows: HashMap::new(), top, bottom, big }
+    }
+    fn row(&mut self, y: StableRowIndex) -> &Vec<(usize, char)> {
+        let pane = &self.pane;
+        self.rows.entry(y).or_insert_with(|| {
+            let (_, lines) = pane.get_lines(y..y + 1);
+            let Some(line) = lines.get(0) else { return vec![(0, '\n')] };
+            let mut row: Vec<(usize, char)> = line.visible_cells()
+                .map(|cell| (cell.cell_index(), cell.str().chars().next().unwrap_or(' ')))
+                .collect();
+            if line.last_cell_was_wrapped() && !row.is_empty() { return row; }
+            while row.last().is_some_and(|(_, c)| c.is_whitespace()) { row.pop(); }
+            let end = row.last().map_or(0, |(x, _)| x + 1);
+            row.push((end, '\n'));
+            row
+        })
+    }
+    /// 0 for a blank (and the end of a row), 1 for punctuation (any
+    /// non-blank for a WORD), 2 for letters, digits and _.
+    fn cls(&mut self, pos: (StableRowIndex, usize)) -> u8 {
+        let big = self.big;
+        let c = self.row(pos.0).get(pos.1).map_or('\n', |(_, c)| *c);
+        if c.is_whitespace() || c == '\n' { 0 }
+        else if big { 1 }
+        else if c.is_alphanumeric() || c == '_' { 2 }
+        else { 1 }
+    }
+    fn empty(&mut self, y: StableRowIndex) -> bool {
+        let row = self.row(y);
+        row.len() == 1 && row[0].1 == '\n'
+    }
+    /// The next character; None at the end of the history.
+    fn inc(&mut self, pos: (StableRowIndex, usize)) -> Option<(StableRowIndex, usize)> {
+        if pos.1 + 1 < self.row(pos.0).len() { Some((pos.0, pos.1 + 1)) }
+        else if pos.0 + 1 < self.bottom { Some((pos.0 + 1, 0)) } else { None }
+    }
+    /// The previous character; None at the top of the history.
+    fn dec(&mut self, pos: (StableRowIndex, usize)) -> Option<(StableRowIndex, usize)> {
+        if pos.1 > 0 { Some((pos.0, pos.1 - 1)) }
+        else if pos.0 > self.top { let len = self.row(pos.0 - 1).len(); Some((pos.0 - 1, len.saturating_sub(1))) }
+        else { None }
+    }
+}
+
 fn draw_sneak_marks(line: &mut Line, marks: &[(Range<usize>, Option<char>)]) {
     for (cells, label) in marks {
         for idx in cells.clone() {

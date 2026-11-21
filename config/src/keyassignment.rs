@@ -861,6 +861,9 @@ pub enum CopyModeAssignment {
     /// A jump to two characters, with labels on the other matches on the
     /// screen (vim-sneak s).
     Sneak { forward: bool },
+    /// A vim word motion: motion "w", "b", "e" or "ge"; big for WORDs
+    /// (W, B, E, gE: runs of non-blank characters).
+    VimWord { motion: String, big: bool },
 }
 
 pub type KeyTable = HashMap<(KeyCode, Modifiers), KeyTableEntry>;

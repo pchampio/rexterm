@@ -730,15 +730,17 @@ impl crate::TermWindow {
             let generation = (self.quad_generation, self.shape_generation, self.config.generation());
             let left = self.dimensions.pixel_width as f32 / -2. + padding_left + border.left.get() as f32 + pos.left as f32 * self.render_metrics.cell_size.width as f32;
             let cell_width = self.render_metrics.cell_size.width as f32;
-            let animated = {
+            let (animated, cursor_offset) = {
                 let mut state = self.pane_state(pane_id);
-                state.copy_scroll.get_or_insert_with(|| super::copyscroll::CopyScroll::new(position, geometry, generation, now))
-                    .paint(position, scroll_buffer, geometry, generation, now, height, top, bottom, layers, cursor_rect,
+                let scroll = state.copy_scroll.get_or_insert_with(|| super::copyscroll::CopyScroll::new(position, geometry, generation, now));
+                let animated = scroll.paint(position, scroll_buffer, geometry, generation, now, height, top, bottom, layers, cursor_rect,
                         copy_selection.map(|s| (s.endpoints, plain_buffer, styled_buffer)),
-                        left, cell_width)?
+                        left, cell_width)?;
+                (animated, scroll.cursor_offset(now))
             };
-            if let Some(rect) = cursor_rect {
-                cursor_buffer.apply_rect_clipped(layers, 0., rect, true);
+            if cursor_offset.abs() >= 0.1 { log::debug!(target: "copy_cursor", "COPY_CURSOR_OFFSET {cursor_offset:.2}"); }
+            if let Some((x0, y0, x1, y1)) = cursor_rect {
+                cursor_buffer.apply_rect_clipped(layers, cursor_offset, (x0, y0 + cursor_offset, x1, y1 + cursor_offset), true);
             }
             if animated {
                 self.update_next_frame_time(Some(now + std::time::Duration::from_millis(8)));
