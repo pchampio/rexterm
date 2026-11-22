@@ -353,11 +353,25 @@ impl crate::TermWindow {
 
         // Draw mode chrome after separators and tabs, in their existing row.
         // Its text never replaces the last line of a terminal pane.
+        // A tiled pane's bar on a separator goes under the popups (layer 1,
+        // the popups are on 2); in the tab bar row it stays above the tab
+        // bar (popups never cover that row). A popup's own bar is on top.
         let mode_layer = self.render_state.as_ref().unwrap().layer_for_zindex(4)?;
         let mut mode_layers = mode_layer.quad_allocator();
-        for pos in self.get_panes_to_render().iter().chain(self.get_floating_panes_to_render().iter()) {
+        let under_layer = self.render_state.as_ref().unwrap().layer_for_zindex(1)?;
+        let mut under_layers = under_layer.quad_allocator();
+        for pos in self.get_panes_to_render().iter() {
+            let in_tab_bar_row = pos.top + pos.height >= self.terminal_size.rows && self.show_tab_bar && self.config.tab_bar_at_bottom;
+            if in_tab_bar_row {
+                self.paint_pane_mode_status(pos, &mut mode_layers)?;
+            } else {
+                self.paint_pane_mode_status(pos, &mut under_layers)?;
+            }
+        }
+        for pos in self.get_floating_panes_to_render().iter() {
             self.paint_pane_mode_status(pos, &mut mode_layers)?;
         }
+        drop(under_layers);
         drop(mode_layers);
 
         self.paint_window_borders(&mut layers)
