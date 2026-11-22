@@ -70,7 +70,8 @@ status itself (OSC 7501), and its hooks add the commands.
 - Copy mode jumps between commands: `Ctrl-k` and `Ctrl-j` move to the previous
   or next command, and `Shift-Y` selects the command at the cursor (multi-line
   commands included). `prefix K` enters copy mode on the previous command.
-  `w b e` and `W B E` move as in vim, and `Ctrl-e`/`Ctrl-y` scroll smoothly.
+  `w b e` and `W B E` move as in vim, `gv` selects the last selection of the
+  pane again, and `Ctrl-e`/`Ctrl-y` scroll smoothly.
 - `Ctrl-h/j/k/l` move between panes and go through Neovim splits and pickers
   (fzf, Ctrl-R history).
 - The window mosaic (`prefix a`, then `M`) shows every window of the session

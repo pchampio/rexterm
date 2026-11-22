@@ -34,6 +34,9 @@ use window::{KeyCode as WKeyCode, Modifiers, WindowOps};
 
 lazy_static::lazy_static! {
     static ref SAVED_PATTERN: Mutex<HashMap<TabId, Pattern>> = Mutex::new(HashMap::new());
+    /// The last visual selection of each pane (its start, the cursor and the
+    /// mode), for gv: it outlives copy mode.
+    static ref LAST_SELECTION: Mutex<HashMap<PaneId, (SelectionCoordinate, usize, StableRowIndex, SelectionMode)>> = Mutex::new(HashMap::new());
     /// Patterns searched in this GUI, oldest first, for Up/Down in search.
     static ref SEARCH_HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 }
@@ -198,6 +201,8 @@ struct CopyRenderable {
     tab_id: TabId,
     searching: Option<Searching>,
     pending_jump: Option<PendingJump>,
+    /// g was typed: the next key completes gg, gv, ge or gE.
+    pending_g: bool,
     last_jump: Option<Jump>,
     /// Right after f/t: the matches show, and f/t again go to the next one.
     sneak_active: bool,
@@ -298,6 +303,7 @@ impl CopyOverlay {
             selection_mode: SelectionMode::Cell,
             searching: None,
             pending_jump: None,
+            pending_g: false,
             last_jump: None,
             sneak_active: false,
             sneak_marks: HashMap::new(),
@@ -760,6 +766,7 @@ impl CopyRenderable {
         self.dirty_results.add(self.compute_search_row());
         self.clamp_cursor_to_scrollback();
         if let Some(sel_start) = self.start {
+            LAST_SELECTION.lock().insert(self.delegate.pane_id(), (sel_start, self.cursor.x, self.cursor.y, self.selection_mode));
             let cursor = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
 
             let (start, end) = match self.selection_mode {
@@ -1674,7 +1681,7 @@ impl CopyRenderable {
 
     /// The pane takes the next keys itself (the target of f/t, a label).
     pub fn captures_keys(&self) -> bool {
-        self.pending_jump.is_some() || !self.sneak_labels.is_empty()
+        self.pending_jump.is_some() || self.pending_g || !self.sneak_labels.is_empty()
     }
 
     fn set_selection_mode(&mut self, mode: &Option<SelectionMode>) {
@@ -1699,6 +1706,17 @@ impl CopyRenderable {
     fn clear_selection_mode(&mut self) {
         self.start.take();
         self.clear_selection();
+    }
+
+    /// vim gv: the last visual selection of this pane again (also from an
+    /// earlier copy mode), the cursor at its end.
+    fn reselect_last(&mut self) {
+        let Some((start, x, y, mode)) = LAST_SELECTION.lock().get(&self.delegate.pane_id()).copied() else { return };
+        self.start = Some(start);
+        self.selection_mode = mode;
+        self.cursor.x = x;
+        self.cursor.y = y;
+        self.select_to_cursor_pos();
     }
 }
 
@@ -1754,7 +1772,18 @@ impl Pane for CopyOverlay {
         let mods = mods.remove_positional_mods();
         // Shift (for F, T or an upper case target) comes as a key of its own:
         // it must not end a jump that waits for its target or a label.
-        if key.is_modifier() && (render.pending_jump.is_some() || !render.sneak_labels.is_empty()) {
+        if key.is_modifier() && (render.pending_jump.is_some() || render.pending_g || !render.sneak_labels.is_empty()) {
+            return Ok(());
+        }
+        if std::mem::take(&mut render.pending_g) {
+            match (key, mods) {
+                (KeyCode::Char('g'), KeyModifiers::NONE) => render.move_to_top(),
+                (KeyCode::Char('v'), KeyModifiers::NONE) => render.reselect_last(),
+                (KeyCode::Char('e'), KeyModifiers::NONE) => render.vim_word("ge", false),
+                (KeyCode::Char('E'), KeyModifiers::NONE) | (KeyCode::Char('E'), KeyModifiers::SHIFT) => render.vim_word("ge", true),
+                // Any other key (Escape) ends the g.
+                _ => {}
+            }
             return Ok(());
         }
         if !render.sneak_labels.is_empty() {
@@ -1881,7 +1910,7 @@ impl Pane for CopyOverlay {
         if render.editing_search && !matches!(assignment, KeyAssignment::CopyMode(_) | KeyAssignment::SendKey(_)) {
             return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
         }
-        if render.pending_jump.is_some() {
+        if render.pending_jump.is_some() || render.pending_g {
             // Block key assignments until key_down is called
             // and resolves the next state
             return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
@@ -1967,6 +1996,8 @@ impl Pane for CopyOverlay {
                     JumpBackward { prev_char } => render.jump(false, *prev_char, false),
                     Sneak { forward } => render.jump(*forward, false, true),
                     VimWord { motion, big } => render.vim_word(motion, *big),
+                    ReselectLast => render.reselect_last(),
+                    GPrefix => render.pending_g = true,
                     JumpAgain => render.jump_again(false),
                     JumpReverse => render.jump_again(true),
                 }

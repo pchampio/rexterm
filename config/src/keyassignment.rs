@@ -864,6 +864,10 @@ pub enum CopyModeAssignment {
     /// A vim word motion: motion "w", "b", "e" or "ge"; big for WORDs
     /// (W, B, E, gE: runs of non-blank characters).
     VimWord { motion: String, big: bool },
+    /// vim gv: select again the last visual selection of this pane.
+    ReselectLast,
+    /// vim g: the next key says what: g (the top), v (gv), e and E (ge, gE).
+    GPrefix,
 }
 
 pub type KeyTable = HashMap<(KeyCode, Modifiers), KeyTableEntry>;

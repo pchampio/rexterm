@@ -685,6 +685,9 @@ function M.apply(config, wezterm, module_dir)
   cb('e','CTRL',act.CopyMode{ScrollViewport=1});cb('y','CTRL',act.CopyMode{ScrollViewport=-1})
   -- w b e and W B E as in vim (WORDs are runs of non-blank characters),
   -- over several lines; in visual mode they extend the selection.
+  -- g waits for the next key: gg (the top), gv (the last selection of this
+  -- pane again, also after copy mode was left), ge and gE.
+  cb('g','NONE',act.CopyMode('GPrefix'))
   for _,m in ipairs{'w','b','e'} do
     cb(m,'NONE',act.CopyMode{VimWord={motion=m,big=false}})
     cb(m:upper(),'SHIFT',act.CopyMode{VimWord={motion=m,big=true}});cb(m:upper(),'NONE',act.CopyMode{VimWord={motion=m,big=true}})
