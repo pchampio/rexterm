@@ -28,11 +28,22 @@ function M.apply(config, wezterm, module_dir)
     end
     local original
     local aliases={Left='LeftArrow',Right='RightArrow',Up='UpArrow',Down='DownArrow'}
+    -- SHIFT|CTRL and CTRL|SHIFT are the same modifiers (the dotfiles write
+    -- SHIFT|CTRL for Ctrl-Shift-V).
+    local function same_mods(a,b)
+      local function set(m)local t={};for part in tostring(m or 'NONE'):gmatch('[^|]+') do t[part]=true end;return t end
+      local x,y=set(a),set(b)
+      for k in pairs(x) do if not y[k] then return false end end
+      for k in pairs(y) do if not x[k] then return false end end
+      return true
+    end
     for i=#(config.keys or {}),1,-1 do
       local b=config.keys[i]
-      if (aliases[b.key] or b.key)==(aliases[key] or key) and b.mods==mods then original=b.action;table.remove(config.keys,i) end
+      if (aliases[b.key] or b.key)==(aliases[key] or key) and same_mods(b.mods,mods) then original=b.action;table.remove(config.keys,i) end
     end
     local fallback=original or act.SendKey{key=key,mods=mods}
+    -- Ctrl-Shift-V outside Rex: the user's own paste, else a plain paste.
+    if key=='V' and same_mods(mods,'CTRL|SHIFT') and not original then fallback=act.PasteFrom('Clipboard') end
     if key=='n' and mods=='ALT' and not original then fallback=act.SpawnTab('CurrentPaneDomain') end
     local common=(mods=='ALT' and (key=='n' or key=='h' or key=='j' or key=='k' or key=='l' or key=='H' or key=='L')) or (mods=='CTRL' and (key=='a' or key=='h' or key=='j' or key=='k' or key=='l' or key:match('Arrow$')))
     local guarded=common and action or callback(function(w,p)
