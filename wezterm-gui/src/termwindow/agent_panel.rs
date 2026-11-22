@@ -11,7 +11,7 @@
 //! the commands of an agent (or opens its only command), l opens the
 //! selected command, h archives it, x stops it (removes an archived one),
 //! H shows or hides archived commands, L shows only running commands,
-//! Escape goes back, then closes.
+//! Escape goes back, then closes; q closes it from any level.
 use super::tmux_windows::{contains, rect, text_line};
 use crate::utilsprites::RenderMetrics;
 use config::keyassignment::AgentPanel as Args;
@@ -279,7 +279,9 @@ impl crate::TermWindow {
                 panel.running_only = !panel.running_only;
                 panel.clamp();
             }
-            KeyCode::Char('\u{1b}') | KeyCode::Char('q') | KeyCode::LeftArrow => {
+            // q hides the panel from any level.
+            KeyCode::Char('q') => self.agent_panel = None,
+            KeyCode::Char('\u{1b}') | KeyCode::LeftArrow => {
                 if panel.command.is_some() {
                     panel.command = None;
                 } else {
