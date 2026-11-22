@@ -16,7 +16,7 @@ local function summarize(wezterm, vars)
   if ok and type(records) == 'table' then
     for _, r in pairs(records) do
       if type(r) == 'table' and (rank[r.state] or -1) > rank[result.state] then
-        result = { state = r.state, text = kinds[r.kind] or names[r.state], message = r.msg or r.title or '', kind = r.kind }
+        result = { state = r.state, text = kinds[r.kind] or names[r.state], message = r.msg or r.title or '', kind = r.kind, app = r.app }
         if type(r.progress) == 'number' then result.text = result.text .. ' ' .. tostring(r.progress) .. '%' end
       end
     end
@@ -167,7 +167,8 @@ function M.apply(config, wezterm, module_dir)
   local function agent_tile(agent)
     if not icons then return nil end
     local slug=icons.slug(agent)
-    return slug:match('^other%-') and 'shell' or slug
+    -- An agent without a logo of its own gets the AI tile (sparkles).
+    return (slug:match('^other%-') or slug=='shell') and (icons.slug('agent')) or slug
   end
   -- The agent sessions of the window's active tab: the panes whose agent
   -- reports its status (bin/rex-agent-status, OSC 7777).
@@ -189,7 +190,7 @@ function M.apply(config, wezterm, module_dir)
   local function shell_menu(window,pane)
     local agents=tab_agents(window)
     local target,c=rex_pane(window,pane)
-    -- Without Rex there is no agent panel (and no agent button).
+    -- Without Rex there is no agent panel: the button only shows the agents.
     if not target then return end
     local ok,list=pcall(function()return target:rex_call('wezterm.agent_shells_watch')end)
     if not ok or type(list)~='table' then list={} end
@@ -247,9 +248,9 @@ function M.apply(config, wezterm, module_dir)
     wezterm.GLOBAL[key] = all
     local ok,vars = pcall(function()return pane:get_user_vars()end)
     if not ok then return end
-    local s = summarize(wezterm, vars)
-    -- An agent shows the agent button, never its tool or message as text.
-    local text = (vars.WEZTERM_AGENT_STATUS or '')=='' and (vars.WEZTERM_AGENT_AGENT or '')=='' and s.message or ''
+    -- Agents show as logos (the agent button), never their tool, title or
+    -- message as text.
+    local text = ''
     local width = math.max(0, math.min(48, math.floor(window:get_dimensions().pixel_width / 24)))
     local ok,c=pcall(function()return pane:rex_context()end)
     -- A local helper popup still belongs to its Rex tab.
@@ -301,14 +302,24 @@ function M.apply(config, wezterm, module_dir)
         local name=peer_vars.WEZTERM_AGENT_AGENT
         if not name or name=='' then name=(peer_vars.WEZTERM_AGENT_TITLE or ''):match('^(%S+)') or 'agent' end
         add(name)
+      elseif valid and summarize(wezterm,peer_vars).state~='idle' then
+        -- A program that reports its status (Codex: OSC 7501) is an agent
+        -- too: the logo of its app, else of its process (the AI tile when
+        -- it has none).
+        local okp,process=pcall(wezterm.json_parse,peer_vars.WEZTERM_REX_PROCESS or 'null')
+        local name=summarize(wezterm,peer_vars).app or (okp and type(process)=='table' and (process.name or process.path))
+        if not name or name=='' or tostring(name):match('^%d[%d%.]*$') then
+          local okf,fg=pcall(function()return peer:get_foreground_process_name()end)
+          name=okf and fg or nil
+        end
+        add((name and name~='') and name or 'agent')
       end
     end
     for _,shell in ipairs(shells) do
       add(shell.agent)
       if shell.running~=false and (shell.state or 'running')=='running' then running=running+1 end
     end
-    -- Outside Rex: no agent button and no status text.
-    if not attached then stack={};right=#indicators>0 and table.concat(indicators,'  ') or '';items={{Background={Color=background}},{Foreground={Color='#586e75'}},{Text=right~='' and right..' ' or ''}} end
+    -- Outside Rex too: the agents of the tab show (no agent panel there).
     if #stack>0 then
       items[#items+1]={Text=icons and icons.cells(stack,icons.width(#stack),true) or ' agents '}
       if running>0 then items[#items+1]={Foreground={Color='#586e75'}};items[#items+1]={Text=' '..tostring(running)..' '} end
