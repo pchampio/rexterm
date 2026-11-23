@@ -1,5 +1,5 @@
 -- Optional native pane navigation for local WezTerm and Rex, including SSH.
-if vim.env.REX_SERVER or not vim.env.TMUX then
+do
   vim.g.smart_splits_multiplexer_integration=false
   local ok,splits=pcall(require,'rex_splits')
   if ok then splits.setup() end
