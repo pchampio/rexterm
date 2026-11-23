@@ -136,6 +136,57 @@ pub async fn send(endpoint: &str, ticket: &str, file: &File, size: u64) -> Resul
     }
 }
 
+/// Downloads a file of the terminal's machine (`download_begin`) into `dir`,
+/// under its own name (with -1, -2... when that name is taken). Returns where
+/// it was written. The stream carries the bytes, then an empty message or a
+/// close with 1000.
+pub async fn download(client: &transport::Client, endpoint: &str, session: &str, block: &str,
+    path: &str, dir: &std::path::Path) -> Result<PathBuf> {
+    let reply = client.call("com.superlogical.terminal.download_begin", serde_json::json!({
+        "session_id": session, "block_id": block,
+        "args": {"ref": format!("download:{}", new_uuid()?), "path": path},
+    })).await?;
+    let ticket = reply["ticket"].as_str().context("download ticket")?;
+    let name = reply["name"].as_str().filter(|n| !n.is_empty() && !n.contains('/')).unwrap_or("download").to_owned();
+    let mut target = dir.join(&name);
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem.to_owned(), format!(".{extension}")),
+        _ => (name.clone(), String::new()),
+    };
+    let mut n = 1;
+    while target.exists() {
+        target = dir.join(format!("{stem}-{n}{extension}"));
+        n += 1;
+    }
+    let mut socket = transport::socket(endpoint, "/api/data", PROTOCOL).await?;
+    wire::handshake(&mut socket, ticket).await?;
+    let mut file = tokio::fs::File::create(&target).await
+        .with_context(|| format!("{} can't be written", target.display()))?;
+    let result: Result<()> = async {
+        use tokio::io::AsyncWriteExt;
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Binary(bytes))) if bytes.is_empty() => break,
+                Some(Ok(Message::Binary(bytes))) => file.write_all(&bytes).await?,
+                Some(Ok(Message::Close(frame))) => match frame {
+                    Some(f) if u16::from(f.code) != 1000 => bail!("Rex stopped the download: {} ({})", f.reason, u16::from(f.code)),
+                    _ => break,
+                },
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            }
+        }
+        file.flush().await?;
+        Ok(())
+    }.await;
+    if let Err(error) = result {
+        tokio::fs::remove_file(&target).await.ok();
+        return Err(error);
+    }
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

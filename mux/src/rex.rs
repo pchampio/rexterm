@@ -78,6 +78,12 @@ struct State {
     parked_panes: HashMap<String, HashMap<String, Arc<RexPane>>>,
     parked_order: Vec<String>,
 }
+/// The port forwards of this GUI (endpoint|host:port), for the life of the
+/// process: a second click on the same URL reuses its forward.
+fn forwards() -> &'static Mutex<HashMap<String, wezterm_rex::forward::Forward>> {
+    static FORWARDS: std::sync::OnceLock<Mutex<HashMap<String, wezterm_rex::forward::Forward>>> = std::sync::OnceLock::new();
+    FORWARDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 /// How many left sessions keep their terminals.
 const PARKED_SESSIONS: usize = 3;
 
@@ -1647,6 +1653,56 @@ impl RexPane {
                     Box::pin(domain.hide_agent_shell(&block)).await.map(|_| Value::Null)
                 }
             };
+        }
+        if method == "wezterm.forward_open" {
+            // A URL of the Rex host (http://localhost:8000/...): forward a
+            // port of this machine to it (the same port when it is free) and
+            // return the URL to open here.
+            let mut url = url::Url::parse(payload["url"].as_str().context("url")?)?;
+            let host = url.host_str().context("URL host")?.trim_matches(|c| c == '[' || c == ']').to_owned();
+            let port = url.port_or_known_default().context("URL port")?;
+            let target = if matches!(host.as_str(), "0.0.0.0" | "::") { "127.0.0.1".to_owned() } else { host.clone() };
+            let session = self.input.lock().session.clone();
+            let endpoint = self.endpoint.clone();
+            let key = format!("{endpoint}|{target}:{port}");
+            let existing = forwards().lock().get(&key).filter(|f| f.is_alive()).map(|f| f.local);
+            let local = match existing {
+                Some(local) => local,
+                None => {
+                    let (e, s, t) = (endpoint.clone(), session.clone(), target.clone());
+                    let forward = smol::unblock(move || wezterm_rex::forward::open(e, s, t, port, port)).await?;
+                    let local = forward.local;
+                    forwards().lock().insert(key, forward);
+                    local
+                }
+            };
+            let local_host = if matches!(host.as_str(), "localhost" | "0.0.0.0" | "::") { "localhost" } else { "127.0.0.1" };
+            url.set_host(Some(local_host))?;
+            url.set_port(Some(local.port())).ok();
+            return Ok(json!({"url": url.to_string(), "port": local.port(), "target": format!("{target}:{port}")}));
+        }
+        if method == "wezterm.download" {
+            // Files of the Rex host to this machine (/tmp unless dir is set).
+            let (client, session) = {
+                let i = self.input.lock();
+                (i.client.clone(), i.session.clone())
+            };
+            let block = self.block.clone();
+            let endpoint = self.endpoint.clone();
+            let dir = std::path::PathBuf::from(payload["dir"].as_str().unwrap_or("/tmp"));
+            let paths = payload["paths"].as_array().context("download paths")?.iter()
+                .map(|v| v.as_str().map(str::to_owned).context("download path")).collect::<Result<Vec<_>>>()?;
+            return smol::unblock(move || -> Result<Value> {
+                tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+                    let mut written = Vec::new();
+                    for path in paths {
+                        let target = wezterm_rex::upload::download(&client, &endpoint, &session, &block, &path, &dir).await
+                            .with_context(|| format!("download of {path}"))?;
+                        written.push(target.to_string_lossy().into_owned());
+                    }
+                    Ok(json!({"paths": written}))
+                })
+            }).await;
         }
         if method == "wezterm.upload" {
             let (client, session) = {

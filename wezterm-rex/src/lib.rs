@@ -10,5 +10,6 @@ pub use ghostty_vt;
 pub mod graphics;
 
 pub mod upload;
+pub mod forward;
 
 pub mod bridge;

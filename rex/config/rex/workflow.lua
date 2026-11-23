@@ -392,7 +392,28 @@ function M.apply(config, wezterm, module_dir)
       return file and file..':'..line or uri
     end
   end
+  -- A web URL of the Rex host (http://localhost:8000/, or the host's own
+  -- name) is not reachable from this desktop: Rex forwards a port of this
+  -- machine to it (the same port when free, as ssh -L) and the forwarded
+  -- URL opens here. Returns true when it did.
+  local function forward_url(w,p,uri)
+    if not context(p) then return false end
+    local scheme,host=uri:match('^(https?)://%[([^%]]+)%]')
+    if not scheme then scheme,host=uri:match('^(https?)://([^/:?#]+)') end
+    if not scheme then return false end
+    local vars=p:get_user_vars() or {}
+    local own=(vars.WEZTERM_HOST or ''):match('^[^.]+')
+    local short=host:match('^[^.]+')
+    local loopback=host=='localhost' or host:match('^127%.') or host=='0.0.0.0' or host=='::1' or host=='::'
+    if not loopback and not (own and own~='' and short==own) then return false end
+    local ok,result=pcall(call,p,'wezterm.forward_open',{url=uri})
+    if not ok then status.message(wezterm,w,'Cannot forward '..uri..': '..tostring(result));return true end
+    wezterm.open_with(result.url)
+    status.message(wezterm,w,'Forwarded localhost:'..tostring(result.port)..' to '..result.target)
+    return true
+  end
   wezterm.on('open-uri',function(w,p,uri)
+    if forward_url(w,p,uri) then return false end
     local path=file_link(uri)
     if not path or not context(p) then return end
     local ok,error=pcall(open_path,w,p,path,false)
@@ -780,6 +801,17 @@ function M.apply(config, wezterm, module_dir)
     if text and text~='' then perform(w,p,act.CopyTo('ClipboardAndPrimarySelection'))
     else perform(w,p,click_copy) end
   end),act.CompleteSelection('PrimarySelection'))
+  -- rex-download FILE... in a Rex shell: the files come to this machine's
+  -- /tmp (the shell sets WEZTERM_DOWNLOAD to {"paths":[...]}).
+  wezterm.on('user-var-changed',function(w,p,name,value)
+    if name~='WEZTERM_DOWNLOAD' or not context(p) or (value or '')=='' then return end
+    local ok,request=pcall(wezterm.json_parse,value)
+    if not ok or type(request)~='table' or type(request.paths)~='table' then return end
+    status.message(wezterm,w,'Downloading '..#request.paths..' file(s)…')
+    local done,result=pcall(call,p,'wezterm.download',{paths=request.paths})
+    if not done then status.message(wezterm,w,'Download failed: '..tostring(result));return end
+    status.message(wezterm,w,'Downloaded to '..table.concat(result.paths,' '))
+  end)
   -- Ctrl-click opens the link under the mouse (a URL of the text or a
   -- hyperlink), also in a program that takes the mouse (Codex): the press
   -- does not reach that program.
@@ -802,7 +834,7 @@ function M.apply(config, wezterm, module_dir)
     patterns={[=[https?://[^\s<>"'`()\[\]{}\\]*[^\s<>"'`()\[\]{}\\.,;:!?]]=]},
     action=callback(function(w,p)
       local url=(w:get_selection_text_for_pane(p) or ''):gsub('[.,;:!?]+$','')
-      if url~='' then wezterm.open_with(url) end
+      if url~='' and not forward_url(w,p,url) then wezterm.open_with(url) end
     end)}})
 end
 return M
