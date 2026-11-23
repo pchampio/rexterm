@@ -1737,7 +1737,8 @@ impl Pane for CopyOverlay {
     }
 
     fn get_title(&self) -> String {
-        format!("Copy mode: {}", self.delegate.get_title())
+        // The tab keeps its title: the mode bar shows copy mode.
+        self.delegate.get_title()
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
