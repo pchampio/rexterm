@@ -462,6 +462,12 @@ pub struct TermWindow {
     pub strip_hover: Option<tmux_windows::StripHover>,
     /// The agent shells of a tab (agent_panel.rs).
     pub agent_panel: Option<agent_panel::AgentPanel>,
+    /// The zoom animation: the zoomed pane grows from its place in the
+    /// layout (in cells) to the whole tab.
+    pub zoom_animation: Option<(mux::pane::PaneId, (usize, usize, usize, usize), std::time::Instant)>,
+    /// The tab, whether it was zoomed, and the place of each pane (cells),
+    /// as painted last.
+    pub last_layout: Option<(mux::tab::TabId, bool, std::collections::HashMap<mux::pane::PaneId, (usize, usize, usize, usize)>)>,
     /// A native selection drag held past the top or bottom of its pane.
     pub selection_autoscroll: Option<selection::SelectionAutoScroll>,
     pub window_overview: Option<tmux_windows::WindowOverview>,
@@ -798,6 +804,8 @@ impl TermWindow {
             popup_drag: None,
             strip_hover: None,
             agent_panel: None,
+            zoom_animation: None,
+            last_layout: None,
             selection_autoscroll: None,
             window_overview: None,
             split_drag: None,

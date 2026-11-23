@@ -633,7 +633,14 @@ function M.apply(config, wezterm, module_dir)
   bind('j','LEADER|CTRL',command_jump(-1,true,false));bind('k','LEADER|CTRL',command_jump(-1,true,false))
   bind('B','LEADER',last_output);bind('P','LEADER',capture);bind('Y','LEADER',select_command);bind('g','LEADER',path_select);bind('_','LEADER',break_pane)
   bind(']','LEADER',callback(paste))
-  bind('.','LEADER',callback(function(w,p)perform(w,p,act.CopyTextTo{text=cwd(p) or '',destination='ClipboardAndPrimarySelection'})end))
+  -- prefix .: copy the directory of the pane (the shell reports it with
+  -- OSC 7, also through SSH; else the directory of its process).
+  bind('.','LEADER',callback(function(w,p)
+    local ok,path=pcall(cwd,p)
+    if not ok or not path or path=='' then status.message(wezterm,w,'No directory known for this pane');return end
+    perform(w,p,act.CopyTextTo{text=path,destination='ClipboardAndPrimarySelection'})
+    status.message(wezterm,w,'Copied '..path)
+  end))
   -- prefix x: in an agent shell popup, stop the command (no question; a
   -- finished command cannot be stopped). Elsewhere, close the pane.
   bind('x','LEADER',callback(function(w,p)

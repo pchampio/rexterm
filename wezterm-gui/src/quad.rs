@@ -374,6 +374,22 @@ impl HeapQuadAllocator {
         }
     }
 
+    /// Move the geometry by (dx, dy) and clip it to `rect` (left, top,
+    /// right, bottom): a pane that grows (the zoom animation).
+    pub fn apply_moved_clipped(&self, other: &mut TripleLayerQuadAllocator,
+        dx: f32, dy: f32, rect: (f32, f32, f32, f32)) {
+        let (left, top, right, bottom) = rect;
+        for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
+            for quad in quads {
+                let mut vertices = quad.to_vertices();
+                for vertex in vertices.iter_mut() { vertex.position[0] += dx; }
+                if clip_y(&mut vertices, dy, top, bottom) && clip_x(&mut vertices, left, right) {
+                    other.extend_with(layer_num, &vertices);
+                }
+            }
+        }
+    }
+
     pub fn apply_to(&self, other: &mut dyn TripleLayerQuadAllocatorTrait) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {

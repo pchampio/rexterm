@@ -274,6 +274,30 @@ impl crate::TermWindow {
         let pane_overlay = panes
             .iter()
             .any(|pos| self.pane_state(pos.pane.pane_id()).overlay.is_some());
+        // Zoom in: the pane grows from its place to the whole tab.
+        const ZOOM_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
+        {
+            let tab = mux::Mux::get().get_active_tab_for_window(self.mux_window_id);
+            let zoomed = tab.as_ref().is_some_and(|t| t.get_zoomed_pane().is_some());
+            let tab_id = tab.as_ref().map(|t| t.tab_id());
+            if let (Some(tab_id), Some((last_tab, was_zoomed, places))) = (tab_id, self.last_layout.as_ref()) {
+                if *last_tab == tab_id && zoomed && !was_zoomed && panes.len() == 1 {
+                    let id = panes[0].pane.pane_id();
+                    let full = (panes[0].left, panes[0].top, panes[0].width, panes[0].height);
+                    if let Some(from) = places.get(&id).copied().filter(|from| *from != full) {
+                        self.zoom_animation = Some((id, from, Instant::now()));
+                    }
+                }
+            }
+            if !zoomed { self.zoom_animation = None; }
+            if let Some(tab_id) = tab_id {
+                let places = panes.iter().map(|p| (p.pane.pane_id(), (p.left, p.top, p.width, p.height))).collect();
+                self.last_layout = Some((tab_id, zoomed, places));
+            }
+            if self.zoom_animation.is_some_and(|(_, _, start)| start.elapsed() >= ZOOM_DURATION) {
+                self.zoom_animation = None;
+            }
+        }
         for mut pos in panes {
             // The tiled pane retains its mux selection while a floating pane
             // has focus. Render it as inactive so that its cursor and IME
@@ -287,6 +311,32 @@ impl crate::TermWindow {
                     pos.pane.advise_focus();
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
+            }
+            if let Some((_, from, start)) = self.zoom_animation.filter(|(id, _, _)| *id == pos.pane.pane_id()) {
+                // Paint the zoomed pane, then show it through a rectangle that
+                // grows from its old place, its text held at the bottom left
+                // corner (a top pane's prompt goes down with its bottom edge).
+                let mut buffer = crate::quad::HeapQuadAllocator::default();
+                self.paint_pane(&pos, &mut crate::quad::TripleLayerQuadAllocator::Heap(&mut buffer)).context("paint_pane")?;
+                let t = (start.elapsed().as_secs_f32() / ZOOM_DURATION.as_secs_f32()).min(1.);
+                let t = 1. - (1. - t).powi(3);
+                let cw = self.render_metrics.cell_size.width as f32;
+                let ch = self.render_metrics.cell_size.height as f32;
+                let (pad_left, pad_top) = self.padding_left_top();
+                let border = self.get_os_border();
+                let tab_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom { self.tab_bar_pixel_height().unwrap_or(0.) } else { 0. };
+                let x0 = self.dimensions.pixel_width as f32 / -2. + pad_left + border.left.get() as f32;
+                let y0 = self.dimensions.pixel_height as f32 / -2. + pad_top + border.top.get() as f32 + tab_height;
+                let px = |(left, top, width, height): (usize, usize, usize, usize)| {
+                    (x0 + left as f32 * cw, y0 + top as f32 * ch, x0 + (left + width) as f32 * cw, y0 + (top + height) as f32 * ch)
+                };
+                let (a, b) = (px(from), px((pos.left, pos.top, pos.width, pos.height)));
+                let mix = |p: f32, q: f32| p + (q - p) * t;
+                let rect = (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2), mix(a.3, b.3));
+                log::debug!(target: "zoom_anim", "ZOOM_RECT {:.1} {:.1} {:.1} {:.1}", rect.0, rect.1, rect.2, rect.3);
+                buffer.apply_moved_clipped(&mut layers, rect.0 - b.0, rect.3 - b.3, rect);
+                self.update_next_frame_time(Some(Instant::now() + std::time::Duration::from_millis(8)));
+                continue;
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
