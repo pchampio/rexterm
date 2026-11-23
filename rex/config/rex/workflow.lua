@@ -635,7 +635,41 @@ function M.apply(config, wezterm, module_dir)
   end)
 
   bind(',','LEADER',rename('session.set_window_label','window_id','Rename window'))
-  bind('t','LEADER|CTRL',callback(function(w,p) status.message(wezterm,w,'Configuration reloaded');perform(w,p,act.ReloadConfiguration) end))
+  -- prefix Ctrl-t: reload the Rex server's config (the server of the
+  -- attached session, also over SSH; else the local tm server), then this
+  -- GUI's WezTerm config, and say what happened.
+  local function reload_rex_server(p)
+    if context(p) then
+      local ok,result=pcall(call,p,'server.config_reload')
+      return ok,result,'Rex server'
+    end
+    local uid=os.getenv('UID')
+    if not uid then local ok,out=wezterm.run_child_process{'id','-u'};uid=ok and out:gsub('%s+$','') or '' end
+    local socket=(os.getenv('XDG_RUNTIME_DIR') or ('/tmp/wezterm-rex-'..uid))..'/wezterm-rex/tm/server.sock'
+    if not wezterm.run_child_process{'test','-S',socket} then return nil end
+    local ok,out,err=wezterm.run_child_process{module_dir..'/../../runtime-rex/bin/rex','-S','unix://'..socket,'--autostart=false','config','reload','--json'}
+    local parsed,result=pcall(wezterm.json_parse,out or '')
+    if parsed and type(result)=='table' then return true,result,'local Rex server' end
+    return false,(err~='' and err or out or 'rex config reload failed'):gsub('%s+$',''),'local Rex server'
+  end
+  bind('t','LEADER|CTRL',callback(function(w,p)
+    local ok,result,which=reload_rex_server(p)
+    local text
+    if ok==nil then
+      text='Reloaded the WezTerm config (no Rex server here)'
+    elseif not ok then
+      text='Reloaded the WezTerm config; the '..which..' config failed: '..tostring(result)
+    else
+      local problems=result.diagnostics or {}
+      text='Reloaded the WezTerm config and the '..which..' config (load '..tostring(result.generation or '?')..')'
+      if #problems>0 then
+        local first=problems[1]
+        text=text..': '..#problems..' problem(s), '..(first.source and (first.source..' ') or '')..tostring(first.message)
+      end
+    end
+    status.message(wezterm,w,text)
+    perform(w,p,act.ReloadConfiguration)
+  end))
   for _,binding in ipairs{{'s','wezterm_save'},{'r','wezterm_restore'}} do
     local key,name=table.unpack(binding)
     bind(key,'LEADER|CTRL',callback(function(w,p)
