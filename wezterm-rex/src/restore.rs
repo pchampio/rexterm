@@ -513,7 +513,10 @@ fn import_images(view:&mut Snapshot,native:&mut Terminal)->Result<()> {
         for stable in start.max(first)..end.min(first+count as isize) {
             let row=stable as f32;let y0=(row*ch).max(top);let y1=((row+1.)*ch).min(bottom);
             if y1<=y0 {continue;}
+            let seq=native.current_seqno();
             let line=native.screen_mut().line_mut((stable-first) as usize);
+            // A parsed blank line has no cells: the image needs one per column.
+            if line.len()<cols {line.resize(cols,seq);}
             for x in (left/cw).floor().max(0.) as usize..((right/cw).ceil() as usize).min(cols) {
                 let x0=(x as f32*cw).max(left);let x1=((x+1) as f32*cw).min(right);
                 if x1<=x0 {continue;}
