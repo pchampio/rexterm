@@ -82,7 +82,7 @@ function M.apply(config, wezterm, module_dir)
   config.rex_popup_styles={
     ['Scratch pad']={border_style='fg=colour001',title='#[align=centre,fg=colour0,bg=colour248] Scratch pad '},
     ['Python pad']={border_style='fg=colour001',title='#[align=centre,fg=colour0,bg=colour248] Python pad '},
-    htop={border_style='fg=default',title='#[align=centre,fg=colour0,bg=colour2] htop '},
+    btop={border_style='fg=default',title='#[align=centre,fg=colour0,bg=colour2] btop '},
     nvtop={border_style='fg=default',title='#[align=centre,fg=colour0,bg=colour2] nvtop '},
     -- A tool command of a coding agent, opened from the agent panel. Only the
     -- border is used: the GUI writes the title (state, keys, command).
@@ -152,6 +152,12 @@ function M.apply(config, wezterm, module_dir)
     elseif c then local text=buffer_get(p);if text then p:paste(text) end
     else p:paste(wezterm.GLOBAL.rex_local_buffer or '') end
   end
+  -- Monitors installed by ~/dotfiles/install/github_app (prebuilt btop and
+  -- nvtop AppImage), with fallbacks. $1 of the GPU one: the pane's
+  -- environment prefix, which may hold its own nvtop.
+  local cpu_monitor='for c in btop "$HOME/.local/bin/btop"; do command -v "$c" >/dev/null 2>&1 && exec "$c"; done; exec htop --sort-key=PERCENT_CPU'
+  local gpu_monitor='for c in "$HOME/.local/bin/nvtop" ${1:+"$1/bin/nvtop"} nvtop; do command -v "$c" >/dev/null 2>&1 && exec "$c"; done; '
+    ..'echo "nvtop is not installed: run ~/dotfiles/install/github_app nvtop"; read -r _'
   local function popup(title,command,width,height)
     return callback(function(w,p)
       local c=context(p);if not c then p:spawn_popup{args=command,width=width,height=height,cwd=cwd(p)};return end
@@ -174,7 +180,13 @@ function M.apply(config, wezterm, module_dir)
       if title=='Python pad' or title=='nvtop' then
         local ok,result=pcall(call,p,'client.action',{action='wezterm_environment',session_id=c.session_id,block_id=c.block_id})
         local env=ok and result.result
-        if env and env.prefix then options.command={env.prefix..'/bin/'..(title=='Python pad' and 'python3' or 'nvtop')} end
+        if title=='nvtop' then
+          -- The prebuilt nvtop (install/github_app nvtop), else one in the
+          -- pane's environment, else any nvtop.
+          options.command={'sh','-c',gpu_monitor,'nvtop',env and env.prefix or ''}
+        elseif env and env.prefix then
+          options.command={env.prefix..'/bin/python3'}
+        end
       end
       call(p,'session.new_layer',{window_id=c.window_id,bounds={(1-width)/2,(1-height)/2,width,height},focus=true,
         layout={block={flavor='com.superlogical.terminal.shell',label=title,options=options}}})
@@ -182,8 +194,8 @@ function M.apply(config, wezterm, module_dir)
   end
   local scratch=popup('Scratch pad',nil,.65,.65)
   local python=popup('Python pad',{'python3'},.65,.65)
-  local htop=popup('htop',{'htop','--sort-key=PERCENT_CPU'},.7,.5)
-  local nvtop=popup('nvtop',{'nvtop'},.5,.5)
+  local btop=popup('btop',{'sh','-c',cpu_monitor,'btop'},.7,.5)
+  local nvtop=popup('nvtop',{'sh','-c',gpu_monitor,'nvtop',''},.5,.5)
   local function hide_or_detach(w,p)
     local c=context(p)
     -- An agent shell: take the popup away, the command keeps running.
@@ -458,7 +470,7 @@ function M.apply(config, wezterm, module_dir)
   end)
 
   local actions={
-    p=python,g=path_select,h=htop,n=nvtop,M=rpc("wezterm.overview"),L=callback(switch_window),d=callback(hide_or_detach),
+    p=python,g=path_select,h=btop,n=nvtop,M=rpc("wezterm.overview"),L=callback(switch_window),d=callback(hide_or_detach),
     f=extract,F=act.QuickSelectArgs{action=callback(function(w,p)
       local text=w:get_selection_text_for_pane(p)
       if text and text~='' then
@@ -491,7 +503,7 @@ function M.apply(config, wezterm, module_dir)
   local menu
   do
     local entries={{'p','Python'},{'c','env activate'}, {},
-      {'n','Nvtop'},{'h','Htop'}, {},
+      {'n','Nvtop'},{'h','Btop'}, {},
       {'M','Windows mosaic'},{'t','Switch client'},{'L','Switch window'},{'_','Break pane'},{'j','Join Pane'},{'r','Rename session'},{'d','Detach client'}, {},
       {'f','Find in pane extrakto/fzf'},{'F','Find in pane thumbs/hints'},{'g','Find path:line in pane'},{'b','Select previous command'},{'B','Open last output in nvim'},{'P','Capture pane'}, {},
       {'<','Swap Pane Up'},{'>','Swap Pane Down'},{'m','Mark'},{'s','Swap Marked pane'},{'S','Swap Marked window'}, {},
