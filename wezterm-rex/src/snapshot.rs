@@ -5,8 +5,15 @@ use ghostty_vt::{Terminal, snapshot};
 pub struct SnapshotBuffer {
     bytes: Vec<u8>,
     scan: usize,
+    /// The screen part of the snapshot, decoded when its READY record arrives.
+    ready: Option<Terminal>,
 }
 impl SnapshotBuffer {
+    /// The snapshot's screen, once, as soon as it arrived (before the
+    /// history and before `push` returns the complete snapshot).
+    pub fn take_ready(&mut self) -> Option<Terminal> {
+        self.ready.take()
+    }
     pub fn push(&mut self, bytes: &[u8]) -> Result<Option<(Terminal, Vec<u8>)>> {
         const LIMIT: usize = 256 * 1024 * 1024;
         ensure!(
@@ -37,6 +44,13 @@ impl SnapshotBuffer {
                 return Ok(None);
             }
             self.scan = end;
+            if tag == 5 {
+                // READY: everything before it is the screen, history comes next.
+                let mut decoder = snapshot::Decoder::from_slice(&self.bytes[..end]);
+                decoder.set_retain_continuation(true)?;
+                decoder.ready().context("Rex snapshot screen decoding")?;
+                self.ready = decoder.into_terminal();
+            }
             if tag == 6 {
                 let mut decoder = snapshot::Decoder::from_slice(&self.bytes[..end]);
                 decoder.set_retain_continuation(true)?;

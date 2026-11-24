@@ -403,6 +403,7 @@ impl TermWindow {
         )?;
         let separator = palette.resolve_fg(ColorAttribute::PaletteIndex(250)).to_linear();
         for pos in tab.iter_panes() {
+            pos.pane.prepare_for_display();
             let dims = pos.pane.get_dimensions();
             let height = pos.height.min(rows.saturating_sub(pos.top));
             let (_, lines) = pos

@@ -314,6 +314,11 @@ pub trait Pane: Downcast + Send + Sync {
     /// for the current identity
     fn advise_focus(&self) {}
 
+    /// Called before a view draws this pane without making it active, such
+    /// as a tab preview or the window mosaic: a pane that loads its content
+    /// on demand starts loading it.
+    fn prepare_for_display(&self) {}
+
     fn has_unseen_output(&self) -> bool {
         false
     }

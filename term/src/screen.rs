@@ -407,6 +407,12 @@ impl Screen {
         self.stable_row_index_offset=skipped;
     }
 
+    /// Take every line, history first, leaving the screen empty: the screen
+    /// is a scratch copy whose lines go to another terminal.
+    pub fn take_remote_lines(&mut self) -> Vec<Line> {
+        std::mem::take(&mut self.lines).into()
+    }
+
     /// Get mutable reference to a line, relative to start of scrollback.
     #[inline]
     pub fn line_mut(&mut self, idx: PhysRowIndex) -> &mut Line {

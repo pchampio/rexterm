@@ -842,6 +842,12 @@ impl TerminalState {
         &self.screen.screen
     }
 
+    /// The primary screen and its scrollback, mutable, even while the
+    /// alternate screen is active.
+    pub fn primary_screen_mut(&mut self) -> &mut Screen {
+        &mut self.screen.screen
+    }
+
     /// True while a tmux mirror shows a mode screen in place of the primary
     /// screen (private mode 9727 replaced the primary screen).
     pub fn tmux_mode_replaces_primary(&self) -> bool {

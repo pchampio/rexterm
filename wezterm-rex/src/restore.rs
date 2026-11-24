@@ -1,14 +1,23 @@
-//! Decode Rex's wire snapshot once, then import it into WezTerm's terminal.
-//! The decoded Ghostty terminal is dropped before live output is processed.
+//! Import Rex's wire snapshot (a Ghostty terminal) into WezTerm's terminal.
+//!
+//! A screen's content goes through Ghostty's VT formatter and WezTerm's
+//! parser, which is fast. Ghostty then corrects what VT text cannot carry:
+//! soft-wrap flags and prompt marks for each row, and the screen rows, which
+//! are copied cell by cell. If the parsed lines do not match Ghostty's rows,
+//! every row is copied cell by cell (slow but exact).
+//!
+//! On attach the server sends the screen first (READY), then the history.
+//! `restore` shows the screen at READY; `history` builds the history lines
+//! away from the live terminal and `merge_history` swaps them in.
 use anyhow::Result;
 use std::sync::Arc;
 use termwiz::{cell::{Blink, Cell as NativeCell, CellAttributes, Intensity, Underline},
     color::ColorAttribute,surface::{Line,SequenceNo}};
-use ghostty_vt::{screen::CellWide, terminal::{Point,PointCoordinate},style::Underline as GUnderline};
+use ghostty_vt::{screen::{CellWide,RowSemanticPrompt}, terminal::{Point,PointCoordinate},style::Underline as GUnderline};
 
 use ghostty_vt::{Terminal as Snapshot, snapshot, screen::Screen,
     fmt::{Format, Formatter, FormatterOptions}, terminal::Mode, style::{Style, StyleColor}};
-use wezterm_term::{Terminal, TerminalSize};
+use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
 fn clone_snapshot(source: &Snapshot) -> Result<Snapshot> {
     let bytes=snapshot::encode(source)?;
@@ -62,10 +71,115 @@ fn import_screen(source: &Snapshot, native: &mut Terminal, screen: Screen) -> Re
     native.advance_bytes(b"\x1b[?6l\x1b[r\x1b[H");
     native.advance_bytes(&bytes);
     let seq=native.current_seqno();
-    let total=view.scrollbar()?.total;
-    let lines=(0..total).map(|y|row(&view,y as u32).map(|r|line(r,seq))).collect::<Result<Vec<_>>>()?;
-    native.screen_mut().import_remote_lines(lines,seq);
+    fix_lines(&view,native,seq)?;
     import_images(&mut view,native)?;
+    Ok(())
+}
+
+/// Plain text of a Ghostty row, without trailing blanks.
+fn row_text(term: &Snapshot, y: u32) -> Result<String> {
+    Ok(row(term,y)?.cells.iter().map(|c|c.text.as_str()).collect::<String>().trim_end().to_owned())
+}
+
+#[cfg(test)]
+thread_local!(static SLOW_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+/// Make the active screen's lines in `native`, just parsed from the
+/// formatter's text, match Ghostty's rows: wrap flags and prompt marks for
+/// the history, an exact copy of the screen rows.
+fn fix_lines(view: &Snapshot, native: &mut Terminal, seq: SequenceNo) -> Result<()> {
+    let total=view.scrollbar()?.total as usize;
+    let rows=(view.rows()? as usize).min(total);
+    let cols=view.cols()?;
+    let screen=native.screen_mut();
+    let count=screen.scrollback_rows();
+    // WezTerm keeps the newest `count` rows when its scrollback is smaller.
+    let aligned=count<=total && count>=rows && {
+        let first=total-count;
+        let mut same=true;
+        for i in [0,count/2,count.saturating_sub(rows+1)] {
+            if i>=count.saturating_sub(rows) {continue;}
+            if row_text(view,(first+i) as u32)?!=screen.line_mut(i).as_str().trim_end() {same=false;break;}
+        }
+        same
+    };
+    if !aligned {
+        #[cfg(test)]
+        SLOW_COPIES.with(|n|n.set(n.get()+1));
+        let keep=total.saturating_sub(total.min(count.max(rows)));
+        let lines=(keep..total).map(|y|row(view,y as u32).map(|r|line(r,seq))).collect::<Result<Vec<_>>>()?;
+        screen.import_remote_lines(lines,seq);
+        return Ok(());
+    }
+    let first=total-count;
+    let (mut previous_wrapped,mut previous_marked)=(false,false);
+    for i in 0..count {
+        let y=(first+i) as u32;
+        if i>=count-rows {
+            *screen.line_mut(i)=line(row(view,y)?,seq);
+            continue;
+        }
+        let grid=view.grid_ref(Point::Screen(PointCoordinate{x:0,y}))?;
+        let r=grid.row()?;
+        let wrapped=r.is_wrapped()?;
+        // Input that wraps past its prompt row has no prompt cells itself.
+        let marked=r.semantic_prompt()?!=RowSemanticPrompt::None || (previous_wrapped && previous_marked);
+        let target=screen.line_mut(i);
+        // Setting the flag keeps a compressed history line compressed.
+        if target.last_cell_was_wrapped()!=wrapped {target.set_last_cell_was_wrapped(wrapped,seq);}
+        if marked {
+            let cells=target.cells_mut();
+            for x in 0..cols {
+                let Some(cell)=cells.get_mut(x as usize) else {break};
+                let g=view.grid_ref(Point::Screen(PointCoordinate{x,y}))?;
+                cell.attrs_mut().set_semantic_type(match g.cell()?.semantic_content()? as u8 {
+                    1=>termwiz::cell::SemanticType::Input,
+                    2=>termwiz::cell::SemanticType::Prompt,
+                    _=>termwiz::cell::SemanticType::Output,
+                });
+            }
+        }
+        target.update_last_change_seqno(seq);
+        (previous_wrapped,previous_marked)=(wrapped,marked);
+    }
+    Ok(())
+}
+
+/// The primary screen's lines of a complete snapshot, made in a scratch
+/// terminal so the live one stays unlocked meanwhile.
+pub struct History {
+    lines: Vec<Line>,
+    view: Snapshot,
+}
+
+/// Build the history of `source` (the complete snapshot whose screen
+/// `restore` showed at READY) for a terminal of this configuration and size.
+pub fn history(mut source: Snapshot, config: Arc<dyn TerminalConfiguration>, size: TerminalSize) -> Result<History> {
+    let mut scratch=Terminal::new(size,config,"WezTerm","rex",Box::new(std::io::sink()));
+    source.vt_write(b"\x18\x1b[?47l");
+    for mode in [Mode::ALT_SCREEN_LEGACY,Mode::ALT_SCREEN,Mode::ALT_SCREEN_SAVE,Mode::SAVE_CURSOR,Mode::SYNC_OUTPUT] {
+        source.set_mode(mode,false)?;
+    }
+    let options=FormatterOptions::new().with_format(Format::Vt).with_unwrap(false).with_trim(false)
+        .with_palette(true).with_style(true).with_hyperlink(true).with_protection(true).with_charsets(true);
+    let bytes=Formatter::new(&source,options)?.format_alloc()?;
+    scratch.advance_bytes(&bytes);
+    let seq=scratch.current_seqno();
+    fix_lines(&source,&mut scratch,seq)?;
+    Ok(History{lines:scratch.screen_mut().take_remote_lines(),view:source})
+}
+
+/// Put the history in the primary screen of `native`. Nothing reached
+/// `native` since `restore` showed the same snapshot's screen.
+pub fn merge_history(mut history: History, native: &mut Terminal) -> Result<()> {
+    native.cancel_resize_preview();
+    native.increment_seqno();
+    let seq=native.current_seqno();
+    native.primary_screen_mut().import_remote_lines(history.lines,seq);
+    if !native.is_alt_screen_active() {
+        import_images(&mut history.view,native)?;
+    }
+    native.make_all_lines_dirty();
     Ok(())
 }
 pub fn restore(source: Snapshot, native: &mut Terminal) -> Result<()> {
@@ -145,6 +259,87 @@ mod tests {
         assert!(text(&native).contains("BEFORE"));assert!(!text(&native).contains("AFTER"));
         native.advance_bytes(b"\x1b[?2026l");
         assert!(text(&native).contains("AFTER"));assert!(!text(&native).contains("BEFORE"));
+    }
+    /// What a line shows: text, wrap flag, and per cell the semantic type,
+    /// colors, and hyperlink.
+    fn shape(line:&Line)->String {
+        let cells=line.visible_cells().map(|c|format!("{}{:?}{:?}{:?}{}",c.str(),c.attrs().semantic_type(),c.attrs().foreground(),c.attrs().background(),
+            c.attrs().hyperlink().map(|l|l.uri().to_owned()).unwrap_or_default())).collect::<Vec<_>>();
+        let mut cells=cells;while cells.last().is_some_and(|c|c.starts_with(" Output")&&c.ends_with("DefaultDefault")) {cells.pop();}
+        format!("{}|{}",line.last_cell_was_wrapped(),cells.join(","))
+    }
+    fn lines_of(t:&Terminal)->Vec<String> {
+        t.screen().lines_in_phys_range(0..t.screen().scrollback_rows()).iter().map(shape).collect()
+    }
+    fn fixture()->Vec<u8> {
+        let mut b=Vec::new();
+        for i in 0..40 {
+            b.extend(format!("\x1b]133;A\x07$ \x1b]133;B\x07echo {i} and a long command that wraps past forty columns\r\n\x1b]133;C\x07").as_bytes());
+            b.extend(format!("\x1b[3{}mout {i}\x1b[0m \x1b]8;;http://x/{i}\x07link\x1b]8;;\x07 \x1b[44m bg \x1b[0m\r\n\x1b]133;D;0\x07",i%8).as_bytes());
+        }
+        b.extend(b"\x1b]133;A\x07$ \x1b]133;B\x07typed");
+        b
+    }
+    /// The fast import (VT text plus Ghostty's wrap flags and prompt marks)
+    /// gives the same lines as copying every cell, both whole and at READY.
+    #[test]
+    fn fast_import_matches_cell_copy() {
+        let source=||{let mut t=Snapshot::new(ghostty_vt::TerminalOptions{cols:40,rows:5,max_scrollback:1024*1024,..Default::default()}).unwrap();
+            t.resize(40,5,8,16).unwrap();t.set_continuation_max_bytes(1024*1024).unwrap();t.vt_write(&fixture());t};
+        let exact={let t=source();let total=t.scrollbar().unwrap().total;let mut n=native();
+            let lines=(0..total).map(|y|line(row(&t,y as u32).unwrap(),1)).collect::<Vec<_>>();
+            n.screen_mut().import_remote_lines(lines,1);lines_of(&n)};
+        let whole={let mut n=native();restore(source(),&mut n).unwrap();lines_of(&n)};
+        let staged={
+            let bytes=snapshot::encode(&source()).unwrap().to_vec();
+            let mut buffer=crate::snapshot::SnapshotBuffer::default();
+            let (full,tail)=buffer.push(&bytes).unwrap().unwrap();assert!(tail.is_empty());
+            let screen=buffer.take_ready().expect("READY screen");
+            let mut n=native();restore(screen,&mut n).unwrap();
+            let h=history(full,n.get_config(),n.get_size()).unwrap();merge_history(h,&mut n).unwrap();
+            n.advance_bytes(b" more");assert!(text(&n).ends_with("$ typed more"),"{:?}",text(&n));
+            lines_of(&n)};
+        assert_eq!(SLOW_COPIES.with(|n|n.get()),0,"a restore copied every cell");
+        assert_eq!(exact.len(),whole.len());
+        for (i,(a,b)) in exact.iter().zip(&whole).enumerate() {assert_eq!(a,b,"whole restore, line {i}");}
+        let staged=&staged[..staged.len()];
+        for (i,(a,b)) in exact.iter().zip(staged).enumerate() {
+            // The live input continued the last line.
+            if i+1==exact.len() {continue;}
+            assert_eq!(a,b,"staged restore, line {i}");
+        }
+        assert!(exact.iter().any(|l|l.contains("Input")) && exact.iter().any(|l|l.starts_with("true")),"fixture lacks marks or wraps");
+    }
+    /// Timing probe for a large history (cargo test -- --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn restore_cost_of_a_large_history() {
+        #[derive(Debug)] struct Big;
+        impl wezterm_term::TerminalConfiguration for Big {
+            fn color_palette(&self)->wezterm_term::color::ColorPalette {Default::default()}
+            fn scrollback_size(&self)->usize {100_000}
+        }
+        for lines in [2_000usize,20_000,100_000] {
+            let mut t=Snapshot::new(ghostty_vt::TerminalOptions{cols:160,rows:50,max_scrollback:64*1024*1024,..Default::default()}).unwrap();
+            t.resize(160,50,8,16).unwrap();
+            let mut bytes=Vec::new();
+            for i in 0..lines {bytes.extend(format!("\x1b[32m{i:>7}\x1b[0m src/module_{}.rs:{}: \x1b[1;31mwarning\x1b[0m: unused variable `value_{i}` in this function body\r\n",i%97,i%1000).as_bytes());}
+            let fed=std::time::Instant::now();t.vt_write(&bytes);let fed=fed.elapsed();
+            let t0=std::time::Instant::now();let wire=snapshot::encode(&t).unwrap().to_vec();let enc=t0.elapsed();
+            let t1=std::time::Instant::now();let mut d=snapshot::Decoder::from_slice(&wire);d.set_retain_continuation(true).unwrap();let decoded=d.decode().unwrap();let dec=t1.elapsed();
+            let mut native=Terminal::new(TerminalSize{cols:160,rows:50,pixel_width:1280,pixel_height:800,dpi:96},Arc::new(Big),"WezTerm","test",Box::new(std::io::sink()));
+            let t2=std::time::Instant::now();restore(decoded,&mut native).unwrap();let res=t2.elapsed();
+            let mut staged=Terminal::new(TerminalSize{cols:160,rows:50,pixel_width:1280,pixel_height:800,dpi:96},Arc::new(Big),"WezTerm","test",Box::new(std::io::sink()));
+            let t4=std::time::Instant::now();let mut buffer=crate::snapshot::SnapshotBuffer::default();let (full,_)=buffer.push(&wire).unwrap().unwrap();
+            restore(buffer.take_ready().unwrap(),&mut staged).unwrap();let screen=t4.elapsed();
+            let t5=std::time::Instant::now();let h=history(full,staged.get_config(),staged.get_size()).unwrap();let built=t5.elapsed();
+            let t6=std::time::Instant::now();merge_history(h,&mut staged).unwrap();let merged=t6.elapsed();
+            assert_eq!(staged.screen().scrollback_rows(),native.screen().scrollback_rows());
+            eprintln!("PROBE staged: screen_at_ready={screen:?} history_unlocked={built:?} merge_locked={merged:?}");
+            let t3=std::time::Instant::now();let mut n2=Terminal::new(TerminalSize{cols:160,rows:50,pixel_width:1280,pixel_height:800,dpi:96},Arc::new(Big),"WezTerm","test",Box::new(std::io::sink()));n2.advance_bytes(&bytes);let raw=t3.elapsed();
+            eprintln!("PROBE lines={lines} rows_kept={} input={}KiB wire={}KiB ghostty_feed={fed:?} encode={enc:?} decode={dec:?} restore={res:?} wezterm_parse_raw={raw:?}",
+                native.screen().scrollback_rows(),bytes.len()/1024,wire.len()/1024);
+        }
     }
     #[test]
     fn live_imgcat_uses_native_wezterm_image_decoder() {

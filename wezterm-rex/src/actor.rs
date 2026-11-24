@@ -107,10 +107,14 @@ impl Actor {
                 tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
                     tokio::select! { _=closed.recv_async()=>return Ok(()), _=activated.recv_async()=>{} }
                     notify(Event::Activated);
-                    let (mut ws, mut welcome, mut offset, mut parser) = fresh(&endpoint, &client, &session, &block, &term, &*notify).await?;
-                    if let Some(size)=*resize_target.lock().unwrap() {term.lock().unwrap().preview_resize(size);}
-                    publish(&term, &shared); notify(Event::Updated);
-                    ready_tx.send(Ok(())).ok();
+                    // The screen shows at READY, before the history arrives.
+                    let mut shown=||{
+                        if let Some(size)=*resize_target.lock().unwrap() {term.lock().unwrap().preview_resize(size);}
+                        publish(&term, &shared); notify(Event::Updated);
+                        ready_tx.try_send(Ok(())).ok();
+                    };
+                    let (mut ws, mut welcome, mut offset, mut parser) = fresh(&endpoint, &client, &session, &block, &term, &*notify, &mut shown).await?;
+                    shown();
                     let mut hold_timer=tokio::time::interval(Duration::from_millis(50));
                     loop {
                         tokio::select! {
@@ -152,7 +156,8 @@ impl Actor {
                                                 }
                                             }
                                             if client.is_connected() {
-                                                if let Ok((socket,w,received,p))=fresh(&endpoint,&client,&session,&block,&term,&*notify).await {
+                                                let mut shown=||{publish(&term,&shared);notify(Event::Updated);};
+                                                if let Ok((socket,w,received,p))=fresh(&endpoint,&client,&session,&block,&term,&*notify,&mut shown).await {
                                                     return Ok((socket,w,Some((received,p))));
                                                 }
                                             }
@@ -243,7 +248,8 @@ fn feed(term: &Mutex<Terminal>, parser: &mut wire::ApcParser, bytes: &[u8], noti
     if let Some(size)=target.as_ref().and_then(|target|**target) {t.preview_resize(size);}
     Ok(())
 }
-async fn fresh(endpoint:&str, client:&Client, session:&str, block:&str, terminal:&Mutex<Terminal>, notify:&dyn Fn(Event))
+async fn fresh(endpoint:&str, client:&Client, session:&str, block:&str, terminal:&Mutex<Terminal>, notify:&dyn Fn(Event),
+    shown:&mut dyn FnMut())
     -> Result<(transport::Socket, wire::Welcome, u64, wire::ApcParser)> {
     let (ticket,mut ws)=tokio::try_join!(
         client.call("data.connect",json!({"session_id":session,"block_id":block,"data_ref_id":"terminal","subprotocol":wire::PROTOCOL})),
@@ -251,11 +257,24 @@ async fn fresh(endpoint:&str, client:&Client, session:&str, block:&str, terminal
     )?;
     let welcome=wire::handshake(&mut ws,ticket["ticket"].as_str().context("missing data ticket")?).await?;
     let mut offset=0;let mut decoder=SnapshotBuffer::default();let mut parser=wire::ApcParser::new(welcome.nonce);
+    let mut shown_early=false;
     loop {
         let bytes=tokio::time::timeout(Duration::from_secs(15),wire::next_binary(&mut ws)).await??;
         offset+=bytes.len() as u64;
-        if let Some((snapshot,tail))=decoder.push(&bytes)? {
-            crate::restore::restore(snapshot,&mut terminal.lock().unwrap())?;
+        let complete=decoder.push(&bytes)?;
+        let early=decoder.take_ready().is_some_and(|screen|{
+            // A screen that cannot be shown early still comes with the rest.
+            crate::restore::restore(screen,&mut terminal.lock().unwrap()).is_ok()
+        });
+        if early {shown_early=true;shown();}
+        if let Some((snapshot,tail))=complete {
+            if shown_early {
+                let (config,size)={let t=terminal.lock().unwrap();(t.get_config(),t.get_size())};
+                let history=crate::restore::history(snapshot,config,size)?;
+                crate::restore::merge_history(history,&mut terminal.lock().unwrap())?;
+            } else {
+                crate::restore::restore(snapshot,&mut terminal.lock().unwrap())?;
+            }
             feed(terminal,&mut parser,&tail,notify,None)?;
             return Ok((ws,welcome,offset,parser));
         }

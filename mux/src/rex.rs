@@ -1137,13 +1137,21 @@ impl Domain for RexDomain {
                         seq=reply.seq;domain.state.lock().revision=None;
                         domain.apply_view(reply.payload["view"].clone()).await?;
                         let panes=domain.state.lock().panes.values().cloned().collect::<Vec<_>>();
-                        for p in panes {
-                            client.call("session.own_block",json!({"session_id":session,"block_ids":[p.block],"mode":"take"})).await?;
-                            p.refresh_status().await?;
-                            p.refresh_process().await?;
+                        // One ownership request for every pane, then each pane's
+                        // metadata at the same time: no round trip per pane.
+                        let blocks=panes.iter().map(|p|p.block.clone()).collect::<Vec<_>>();
+                        if !blocks.is_empty() {
+                            client.call("session.own_block",json!({"session_id":session,"block_ids":blocks,"mode":"take"})).await?;
+                        }
+                        let tasks=panes.into_iter().map(|p|promise::spawn::spawn(async move {
+                            let (status,process)=smol::future::zip(p.refresh_status(),p.refresh_process()).await;
+                            status?;process?;
                             p.send_size(*p.size.lock())?;
-
                             let mut frame=p.actor.frame.lock().unwrap();if frame.error.is_none(){frame.connected=true;}
+                            Ok::<_,anyhow::Error>(())
+                        })).collect::<Vec<_>>();
+                        for task in tasks {
+                            if let Err(e)=task.await {log::error!("Rex reattach pane: {e:#}")}
                         }
                         Ok::<_,anyhow::Error>(())
                     }.await;
@@ -2188,6 +2196,9 @@ impl Pane for RexPane {
             "block.close",
             json!({"session_id":i.session,"block_id":i.block}),
         );
+    }
+    fn prepare_for_display(&self) {
+        self.actor.activate();
     }
     fn advise_focus(&self) {
         self.actor.activate();
