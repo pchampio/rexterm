@@ -868,6 +868,10 @@ pub enum CopyModeAssignment {
     ReselectLast,
     /// vim g: the next key says what: g (the top), v (gv), e and E (ge, gE).
     GPrefix,
+    /// Close copy mode when a later ScrollByLine brings the view back to the
+    /// live screen without a selection (copy mode opened by the mouse wheel,
+    /// like tmux's copy-mode -e).
+    ExitAtBottom,
 }
 
 pub type KeyTable = HashMap<(KeyCode, Modifiers), KeyTableEntry>;

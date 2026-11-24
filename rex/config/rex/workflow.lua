@@ -817,8 +817,11 @@ function M.apply(config, wezterm, module_dir)
     mouse({Down={streak=1,button={[wheel[1]]=1}}},'NONE',callback(function(w,p)
       if not w:copy_mode_state(p) and p:is_alt_screen_active() then
         for _=1,3 do perform(w,p,act.SendKey{key=wheel[2]<0 and 'UpArrow' or 'DownArrow'}) end
-      elseif wheel[2]<0 or w:copy_mode_state(p) then
+      elseif w:copy_mode_state(p) then
         perform(w,p,act.Multiple{act.ActivateCopyMode,act.CopyMode{ScrollByLine=wheel[2]}})
+      elseif wheel[2]<0 then
+        -- Opened by the wheel: scrolling back down to the prompt closes it.
+        perform(w,p,act.Multiple{act.ActivateCopyMode,act.CopyMode('ExitAtBottom'),act.CopyMode{ScrollByLine=wheel[2]}})
       end
     end),act.ScrollByLine(wheel[2]))
   end

@@ -203,6 +203,8 @@ struct CopyRenderable {
     pending_jump: Option<PendingJump>,
     /// g was typed: the next key completes gg, gv, ge or gE.
     pending_g: bool,
+    /// Opened by the mouse wheel: scrolling back to the live screen closes it.
+    exit_at_bottom: bool,
     last_jump: Option<Jump>,
     /// Right after f/t: the matches show, and f/t again go to the next one.
     sneak_active: bool,
@@ -304,6 +306,7 @@ impl CopyOverlay {
             searching: None,
             pending_jump: None,
             pending_g: false,
+            exit_at_bottom: false,
             last_jump: None,
             sneak_active: false,
             sneak_marks: HashMap::new(),
@@ -905,6 +908,12 @@ impl CopyRenderable {
         let dims=self.delegate.get_dimensions();
         let old=self.viewport.unwrap_or(dims.physical_top);
         let top=(old+amount).clamp(dims.scrollback_top,dims.physical_top);
+        if self.exit_at_bottom && amount>0 && top==dims.physical_top && self.start.is_none() {
+            // Back at the shell prompt: leave copy mode as if it never opened.
+            self.set_viewport(None);
+            self.close();
+            return;
+        }
         self.cursor.y+=top-old;
         self.viewport=Some(top);
         self.scrolling=true;
@@ -1999,6 +2008,7 @@ impl Pane for CopyOverlay {
                     VimWord { motion, big } => render.vim_word(motion, *big),
                     ReselectLast => render.reselect_last(),
                     GPrefix => render.pending_g = true,
+                    ExitAtBottom => render.exit_at_bottom = true,
                     JumpAgain => render.jump_again(false),
                     JumpReverse => render.jump_again(true),
                 }
