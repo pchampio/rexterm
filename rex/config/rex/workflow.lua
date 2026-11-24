@@ -325,6 +325,53 @@ function M.apply(config, wezterm, module_dir)
       if id and id~='' then call(p,'wezterm.switch_session',{session=id}) end
     end)
   end)
+  -- Port forwards of the session (Rex tunnel blocks), like ssh -L and -R:
+  -- list them, close one, or add one. "here" is the machine of this GUI,
+  -- "server" the Rex server's.
+  local port_forwards
+  local function forward_row(f)
+    local listen,connect=f.listen or '-',f.connect or '-'
+    local route=f.direction=='remote' and ('server '..listen..'  →  here '..connect) or ('here '..listen..'  →  server '..connect)
+    local state=(f.state or '?')..(f.mine and ', this window' or '')
+    return string.format('%s  %-44s %s, %d conn',f.direction=='remote' and 'R' or 'L',route,state,f.connections or 0)
+  end
+  local function new_forward(w,p,remote)
+    local description=remote
+      and 'server → here (like ssh -R): [bind:]port:host:hostport. 9000:localhost:3000 listens on the server\'s port 9000 and connects to localhost:3000 from this machine. bind * = every interface, port 0 = any free port.'
+      or 'here → server (like ssh -L): [bind:]port:host:hostport. 8080:localhost:3000 listens on this machine\'s port 8080 and connects to localhost:3000 from the server. bind * = every interface.'
+    perform(w,p,act.PromptInputLine{description=description,action=callback(function(win,pane,text)
+      if not text or text:match('^%s*$') then return end
+      local ok,result=pcall(call,pane,'wezterm.forward_new',{remote=remote,spec=text})
+      if ok then
+        status.message(wezterm,win,remote and ('Forwarding server '..result.listen..' → here '..result.connect)
+          or ('Forwarding here '..result.listen..' → server '..result.connect))
+      else
+        status.message(wezterm,win,'Port forward failed: '..tostring(result):gsub('^.-: ',''))
+      end
+      port_forwards(win,pane)
+    end)})
+  end
+  port_forwards=function(w,p)
+    if not context(p) then status.message(wezterm,w,'Port forwards need a Rex session: run tm or rex-attach in this shell');return end
+    local ok,result=pcall(call,p,'wezterm.forward_list')
+    if not ok then status.message(wezterm,w,'Port forwards: '..tostring(result));return end
+    local choices={{id='new-local',label='+ new  here → server  (ssh -L: listen here, connect from the server)'},
+      {id='new-remote',label='+ new  server → here  (ssh -R: listen on the server, connect from here)'}}
+    local by_id={}
+    for _,f in ipairs(result.forwards or {}) do
+      by_id[f.block_id]=f
+      choices[#choices+1]={id=f.block_id,label='close  '..forward_row(f)}
+    end
+    local title=#choices>2 and 'Port forwards: Enter closes a forward or adds one' or 'Port forwards: none yet, add one'
+    selector.open(wezterm,w,p,{title=title,choices=choices,width=.8,height=.4},function(id)
+      if not id then return end
+      if id=='new-local' or id=='new-remote' then new_forward(w,p,id=='new-remote');return end
+      local f=by_id[id]
+      local closed,err=pcall(call,p,'wezterm.forward_close',{block_id=id})
+      status.message(wezterm,w,closed and ('Closed the forward '..(f and forward_row(f):gsub('%s+',' ') or id)) or ('Close failed: '..tostring(err)))
+      port_forwards(w,p)
+    end)
+  end
   local capture=callback(function(w,p)
     perform(w,p,act.PromptInputLine{description='Save history on the Rex server',initial_value='/tmp/rex.history',action=callback(function(_,pane,path)
       if not path or path=='' then return end
@@ -470,7 +517,7 @@ function M.apply(config, wezterm, module_dir)
   end)
 
   local actions={
-    p=python,g=path_select,h=btop,n=nvtop,M=rpc("wezterm.overview"),L=callback(switch_window),d=callback(hide_or_detach),
+    p=python,g=path_select,h=btop,n=nvtop,['\\']=callback(function(w,p)port_forwards(w,p)end),M=rpc("wezterm.overview"),L=callback(switch_window),d=callback(hide_or_detach),
     f=extract,F=act.QuickSelectArgs{action=callback(function(w,p)
       local text=w:get_selection_text_for_pane(p)
       if text and text~='' then
@@ -503,7 +550,7 @@ function M.apply(config, wezterm, module_dir)
   local menu
   do
     local entries={{'p','Python'},{'c','env activate'}, {},
-      {'n','Nvtop'},{'h','Btop'}, {},
+      {'n','Nvtop'},{'h','Btop'},{'\\','Port forwards'}, {},
       {'M','Windows mosaic'},{'t','Switch client'},{'L','Switch window'},{'_','Break pane'},{'j','Join Pane'},{'r','Rename session'},{'d','Detach client'}, {},
       {'f','Find in pane extrakto/fzf'},{'F','Find in pane thumbs/hints'},{'g','Find path:line in pane'},{'b','Select previous command'},{'B','Open last output in nvim'},{'P','Capture pane'}, {},
       {'<','Swap Pane Up'},{'>','Swap Pane Down'},{'m','Mark'},{'s','Swap Marked pane'},{'S','Swap Marked window'}, {},
@@ -517,7 +564,7 @@ function M.apply(config, wezterm, module_dir)
       local ok_tabs,tabs=pcall(function()return #w:mux_window():tabs()end)
       tabs=ok_tabs and tabs or 1
       local marked=c and mark and mark.session_id==c.session_id
-      local unavailable={c=not c,M=not c,r=not c,m=not c,t=not c,B=not c,P=not c,
+      local unavailable={['\\']=not c,c=not c,M=not c,r=not c,m=not c,t=not c,B=not c,P=not c,
         ['_']=not c or panes<2,['<']=not c or panes<2,['>']=not c or panes<2,j=not c or tabs<2,
         s=not marked or mark.block_id==c.block_id,S=not marked or mark.window_id==c.window_id,
         d=not c and not p:is_popup_visible()}

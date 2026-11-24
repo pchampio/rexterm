@@ -1689,6 +1689,62 @@ impl RexPane {
             url.set_port(Some(local.port())).ok();
             return Ok(json!({"url": url.to_string(), "port": local.port(), "target": format!("{target}:{port}")}));
         }
+        if method == "wezterm.forward_list" {
+            // The session's forwards (tunnel blocks), whoever carries them;
+            // `mine` marks the ones this GUI carries.
+            let (client, session) = {
+                let i = self.input.lock();
+                (i.client.clone(), i.session.clone())
+            };
+            let blocks = client.call("session.list_blocks", json!({"session_id": session})).await?;
+            let mine = forwards().lock().values().filter(|f| f.is_alive()).map(|f| f.block.clone()).collect::<HashSet<_>>();
+            let mut list = Vec::new();
+            for block in blocks["blocks"].as_array().into_iter().flatten() {
+                if block["creator_name"] != "com.superlogical.tunnel" { continue; }
+                let Some(id) = block["block_id"].as_str() else { continue };
+                let info = client.call("com.superlogical.tunnel.info",
+                    json!({"session_id": session, "block_id": id, "args": {}})).await.unwrap_or_default();
+                let mut row = wezterm_rex::forward::describe(block, &info);
+                row["mine"] = json!(mine.contains(id));
+                list.push(row);
+            }
+            return Ok(json!({"forwards": list}));
+        }
+        if method == "wezterm.forward_new" {
+            // {remote, spec}: a forward like ssh -L (remote false: listen
+            // here, connect from the server) or ssh -R (remote true).
+            let remote = payload["remote"].as_bool().unwrap_or(false);
+            let spec = wezterm_rex::forward::Spec::parse(remote, payload["spec"].as_str().context("spec")?)?;
+            let session = self.input.lock().session.clone();
+            let endpoint = self.endpoint.clone();
+            let e = endpoint.clone();
+            let forward = smol::unblock(move || wezterm_rex::forward::start(e, session, spec)).await?;
+            let row = json!({"block_id": forward.block, "listen": forward.listen, "connect": forward.target,
+                "direction": if forward.remote { "remote" } else { "local" }});
+            forwards().lock().insert(format!("{endpoint}|{}", forward.block), forward);
+            return Ok(row);
+        }
+        if method == "wezterm.forward_close" {
+            // A forward this GUI carries stops (and closes its block);
+            // another one's block is closed, which stops its carrier.
+            let block = payload["block_id"].as_str().context("block_id")?.to_owned();
+            let carried = {
+                let mut all = forwards().lock();
+                let key = all.iter().find(|(_, f)| f.block == block).map(|(k, _)| k.clone());
+                key.and_then(|k| all.remove(&k))
+            };
+            if let Some(forward) = carried {
+                let alive = forward.is_alive();
+                drop(forward);
+                if alive { return Ok(json!({"closed": block})); }
+            }
+            let (client, session) = {
+                let i = self.input.lock();
+                (i.client.clone(), i.session.clone())
+            };
+            client.call("block.close", json!({"session_id": session, "block_id": block})).await?;
+            return Ok(json!({"closed": block}));
+        }
         if method == "wezterm.download" {
             // Files of the Rex host to this machine (/tmp unless dir is set).
             let (client, session) = {
