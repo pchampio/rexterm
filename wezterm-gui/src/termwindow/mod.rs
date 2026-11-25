@@ -468,6 +468,11 @@ pub struct TermWindow {
     /// The tab, whether it was zoomed, and the place of each pane (cells),
     /// as painted last.
     pub last_layout: Option<(mux::tab::TabId, bool, std::collections::HashMap<mux::pane::PaneId, (usize, usize, usize, usize)>)>,
+    /// Zoom out: the unzoomed pane shrinks from the whole tab (its place
+    /// when zoomed, in cells) back to its place in the layout or popup.
+    pub unzoom_animation: Option<(mux::pane::PaneId, (usize, usize, usize, usize), std::time::Instant)>,
+    /// The tab, the zoomed pane and its place, as painted last.
+    pub last_zoomed: Option<(mux::tab::TabId, mux::pane::PaneId, (usize, usize, usize, usize))>,
     /// A native selection drag held past the top or bottom of its pane.
     pub selection_autoscroll: Option<selection::SelectionAutoScroll>,
     pub window_overview: Option<tmux_windows::WindowOverview>,
@@ -806,6 +811,8 @@ impl TermWindow {
             agent_panel: None,
             zoom_animation: None,
             last_layout: None,
+            unzoom_animation: None,
+            last_zoomed: None,
             selection_autoscroll: None,
             window_overview: None,
             split_drag: None,

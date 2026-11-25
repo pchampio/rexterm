@@ -257,10 +257,11 @@ impl crate::TermWindow {
         }
 
         let floating_panes = self.get_floating_panes_to_render();
+        // One more sublayer above the popups for the zoom out animation.
         self.render_state
             .as_ref()
             .unwrap()
-            .retain_floating_sublayers(floating_panes.len());
+            .retain_floating_sublayers(floating_panes.len() + 1);
         let floating_layers = (0..floating_panes.len())
             .map(|order| {
                 self.render_state
@@ -274,7 +275,8 @@ impl crate::TermWindow {
         let pane_overlay = panes
             .iter()
             .any(|pos| self.pane_state(pos.pane.pane_id()).overlay.is_some());
-        // Zoom in: the pane grows from its place to the whole tab.
+        // Zoom in: the pane (tiled or popup) grows from its place to the
+        // whole tab. Zoom out: it shrinks back from the whole tab.
         const ZOOM_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
         {
             let tab = mux::Mux::get().get_active_tab_for_window(self.mux_window_id);
@@ -290,14 +292,34 @@ impl crate::TermWindow {
                 }
             }
             if !zoomed { self.zoom_animation = None; }
+            let place = |p: &mux::tab::PositionedPane| (p.left, p.top, p.width, p.height);
+            if let (Some(tab_id), Some((last_tab, id, full))) = (tab_id, self.last_zoomed) {
+                if last_tab == tab_id && !zoomed {
+                    let to = panes.iter().chain(floating_panes.iter()).find(|p| p.pane.pane_id() == id).map(place);
+                    if let Some(to) = to.filter(|to| *to != full) {
+                        self.unzoom_animation = Some((id, full, Instant::now()));
+                    }
+                }
+            }
+            if zoomed { self.unzoom_animation = None; }
+            self.last_zoomed = match (tab_id, zoomed && panes.len() == 1) {
+                (Some(tab_id), true) => Some((tab_id, panes[0].pane.pane_id(), place(&panes[0]))),
+                _ => None,
+            };
             if let Some(tab_id) = tab_id {
-                let places = panes.iter().map(|p| (p.pane.pane_id(), (p.left, p.top, p.width, p.height))).collect();
+                let places = panes.iter().chain(floating_panes.iter()).map(|p| (p.pane.pane_id(), place(p))).collect();
                 self.last_layout = Some((tab_id, zoomed, places));
             }
             if self.zoom_animation.is_some_and(|(_, _, start)| start.elapsed() >= ZOOM_DURATION) {
                 self.zoom_animation = None;
             }
+            if self.unzoom_animation.is_some_and(|(_, _, start)| start.elapsed() >= ZOOM_DURATION) {
+                self.unzoom_animation = None;
+            }
         }
+        let unzoom_id = self.unzoom_animation.map(|(id, _, _)| id);
+        let mut unzoom_pane = None;
+        let mut unzoom_popup = false;
         for mut pos in panes {
             // The tiled pane retains its mux selection while a floating pane
             // has focus. Render it as inactive so that its cursor and IME
@@ -338,6 +360,11 @@ impl crate::TermWindow {
                 self.update_next_frame_time(Some(Instant::now() + std::time::Duration::from_millis(8)));
                 continue;
             }
+            if unzoom_id == Some(pos.pane.pane_id()) {
+                // Painted last, above the other panes (below).
+                unzoom_pane = Some(pos);
+                continue;
+            }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
 
@@ -369,6 +396,7 @@ impl crate::TermWindow {
             self.paint_tmux_separators(tab, strip_shown, &mut chrome_layers)
                 .context("paint_tmux_separators")?;
         }
+        let floating_count = floating_panes.len();
         for (floating_pane, float_layer) in floating_panes.into_iter().zip(floating_layers) {
             let mut floating_pane_layers = float_layer.quad_allocator();
             if floating_pane.is_active {
@@ -378,10 +406,60 @@ impl crate::TermWindow {
                     mux::Mux::get().record_focus_for_current_identity(floating_pane.pane.pane_id());
                 }
             }
+            if unzoom_id == Some(floating_pane.pane.pane_id()) {
+                unzoom_popup = true;
+                unzoom_pane = Some(floating_pane);
+                continue;
+            }
             self.paint_pane(&floating_pane, &mut floating_pane_layers)
                 .context("paint_pane")?;
             self.paint_floating_pane_border(floating_pane, &mut floating_pane_layers)
                 .context("paint_floating_pane_border")?;
+        }
+        if let (Some(pos), Some((_, from, start))) = (unzoom_pane, self.unzoom_animation) {
+            // Zoom out: a rectangle shrinks from the whole tab to the pane's
+            // place, filled with its background, its text held at the bottom
+            // left corner (a top pane's prompt goes up with its bottom edge).
+            let layer = self.render_state.as_ref().unwrap().layer_for_zindex_and_sublayer(2, floating_count)?;
+            let mut unzoom_layers = layer.quad_allocator();
+            let mut buffer = crate::quad::HeapQuadAllocator::default();
+            self.paint_pane(&pos, &mut crate::quad::TripleLayerQuadAllocator::Heap(&mut buffer)).context("paint_pane")?;
+            let t = (start.elapsed().as_secs_f32() / ZOOM_DURATION.as_secs_f32()).min(1.);
+            let t = 1. - (1. - t).powi(3);
+            let cw = self.render_metrics.cell_size.width as f32;
+            let ch = self.render_metrics.cell_size.height as f32;
+            let (pad_left, pad_top) = self.padding_left_top();
+            let border = self.get_os_border();
+            let tab_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom { self.tab_bar_pixel_height().unwrap_or(0.) } else { 0. };
+            let (half_w, half_h) = (self.dimensions.pixel_width as f32 / 2., self.dimensions.pixel_height as f32 / 2.);
+            let x0 = -half_w + pad_left + border.left.get() as f32;
+            let y0 = -half_h + pad_top + border.top.get() as f32 + tab_height;
+            let px = |(left, top, width, height): (usize, usize, usize, usize)| {
+                (x0 + left as f32 * cw, y0 + top as f32 * ch, x0 + (left + width) as f32 * cw, y0 + (top + height) as f32 * ch)
+            };
+            let (a, b) = (px(from), px((pos.left, pos.top, pos.width, pos.height)));
+            let mix = |p: f32, q: f32| p + (q - p) * t;
+            let rect = (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2), mix(a.3, b.3));
+            log::debug!(target: "zoom_anim", "UNZOOM_RECT {:.1} {:.1} {:.1} {:.1}", rect.0, rect.1, rect.2, rect.3);
+            let background = pos.pane.palette().background.to_linear()
+                .mul_alpha(self.config.window_background_opacity);
+            // A popup's frame is one cell outside it: cover that cell too.
+            let (mx, my) = if unzoom_popup { (cw, ch) } else { (0., 0.) };
+            self.filled_rectangle(&mut unzoom_layers, 0,
+                euclid::rect(rect.0 - mx + half_w, rect.1 - my + half_h, rect.2 - rect.0 + 2. * mx, rect.3 - rect.1 + 2. * my), background)
+                .context("filled_rectangle for zoom out")?;
+            buffer.apply_moved_clipped(&mut unzoom_layers, rect.0 - b.0, rect.3 - b.3, rect);
+            if unzoom_popup {
+                // The popup's own frame and title, around the rectangle.
+                let mut frame = pos.clone();
+                frame.left = ((rect.0 - x0) / cw).round().max(0.) as usize;
+                frame.top = ((rect.1 - y0) / ch).round().max(0.) as usize;
+                frame.width = (((rect.2 - x0) / cw).round() as usize).saturating_sub(frame.left).max(1);
+                frame.height = (((rect.3 - y0) / ch).round() as usize).saturating_sub(frame.top).max(1);
+                self.paint_floating_pane_border(frame, &mut unzoom_layers)
+                    .context("paint_floating_pane_border for zoom out")?;
+            }
+            self.update_next_frame_time(Some(Instant::now() + std::time::Duration::from_millis(8)));
         }
 
         if let Some(pane) = self.get_active_pane_or_overlay() {
