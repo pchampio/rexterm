@@ -132,7 +132,7 @@ fi
 "$root/runtime-rex/bin/rex" -S "$endpoint" --autostart=false api call client.keymap '{}' | python3 -c '
 import json,sys
 names={a["name"] for a in json.load(sys.stdin).get("actions",[])}
-required={"wezterm_save","wezterm_restore","wezterm_capture","wezterm_environment","wezterm_split_context","wezterm_buffer_begin","wezterm_buffer_append","wezterm_buffer_read"}
+required={"wezterm_save","wezterm_restore","wezterm_capture","wezterm_environment","wezterm_buffer_begin","wezterm_buffer_append","wezterm_buffer_read"}
 if not required <= names: sys.exit("Install scripts/install-rex-companion.py on this Rex server before launching (or connect with --ssh). Missing: "+", ".join(sorted(required-names)))
 '
 export REX_ENDPOINT="$endpoint" REX_SESSION="$session"

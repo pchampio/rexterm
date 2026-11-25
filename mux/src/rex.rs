@@ -1281,21 +1281,14 @@ impl Domain for RexDomain {
             } => (command, command_dir),
             _ => anyhow::bail!("Rex move split requires session.move_block"),
         };
-        let remote_cwd = anchor.get_current_working_dir(CachePolicy::AllowStale)
-            .map(|u| u.path().to_owned());
+        // In a pane running ssh, OSC 7 names a directory on the remote host:
+        // the new local shell starts in ssh's own directory (below) instead.
+        // The GUI fills command_dir from OSC 7 too, so drop it as well.
         if command.is_none() && anchor.get_foreground_process_name(CachePolicy::AllowStale)
             .is_some_and(|name| std::path::Path::new(&name).file_name().is_some_and(|n| n == "ssh")) {
-            let result = client.call("client.action", json!({"action":"wezterm_split_context",
-                "session_id":session,"block_id":anchor.block,"args":{"remote_cwd":remote_cwd}})).await?;
-            let context = &result["result"];
-            if let Some(argv) = context["command"].as_array() {
-                let argv = argv.iter().map(|v| v.as_str().map(std::ffi::OsString::from)
-                    .context("SSH split argument must be a string")).collect::<Result<Vec<_>>>()?;
-                command = Some(CommandBuilder::from_argv(argv));
-            }
-            cwd = context["cwd"].as_str().map(str::to_owned);
+            cwd = None;
         } else if cwd.is_none() {
-            cwd = remote_cwd;
+            cwd = anchor.get_current_working_dir(CachePolicy::AllowStale).map(|u| u.path().to_owned());
         }
         if cwd.is_none() {
             let process = anchor.call("com.superlogical.terminal.process", json!({})).await?;
