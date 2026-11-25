@@ -51,6 +51,7 @@ local tiles={
   ["npm"]="npm",
   ["npx"]="npm",
   ["nvim"]="neovim",
+  ["nvitop"]="btop",
   ["nvtop"]="btop",
   ["opencode"]="agent",
   ["pgcli"]="pgcli",
