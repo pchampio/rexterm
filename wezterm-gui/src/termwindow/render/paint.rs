@@ -296,7 +296,7 @@ impl crate::TermWindow {
             if let (Some(tab_id), Some((last_tab, id, full))) = (tab_id, self.last_zoomed) {
                 if last_tab == tab_id && !zoomed {
                     let to = panes.iter().chain(floating_panes.iter()).find(|p| p.pane.pane_id() == id).map(place);
-                    if let Some(to) = to.filter(|to| *to != full) {
+                    if to.is_some_and(|to| to != full) {
                         self.unzoom_animation = Some((id, full, Instant::now()));
                     }
                 }

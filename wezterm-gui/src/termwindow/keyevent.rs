@@ -93,6 +93,11 @@ impl KeyTableState {
         }
     }
 
+    pub fn top_is_one_shot(&mut self) -> bool {
+        while self.process_expiration() {}
+        self.stack.last().is_some_and(|entry| entry.one_shot)
+    }
+
     pub fn current_table(&mut self) -> Option<&str> {
         while self.process_expiration() {}
         self.stack.last().map(|entry| entry.name.as_str())
@@ -223,6 +228,17 @@ impl super::TermWindow {
         mods: Modifiers,
         only_key_bindings: OnlyKeyBindings,
     ) -> Option<(KeyTableEntry, Option<String>)> {
+        // A one-shot window table (the prefix key) was pushed after the
+        // overlay's own table, so its keys win: prefix Space zooms in copy
+        // mode instead of starting a selection there.
+        if self.key_table_state.top_is_one_shot() {
+            if let Some((entry, table_name)) =
+                self.key_table_state
+                    .lookup_key(&self.input_map, keycode, mods, only_key_bindings)
+            {
+                return Some((entry, table_name.map(|s| s.to_string())));
+            }
+        }
         // Tab-wide selectors have their own bindings just like pane overlays.
         // Consult them before application-wide pane-navigation shortcuts.
         if let Some(tab) = mux::Mux::get().get_active_tab_for_window(self.mux_window_id) {
@@ -595,7 +611,10 @@ impl super::TermWindow {
     pub fn current_key_table_name(&mut self) -> Option<String> {
         let mut name = None;
 
-        if let Some(pane) = self.get_active_pane_or_overlay() {
+        if self.key_table_state.top_is_one_shot() {
+            name = self.key_table_state.current_table().map(|s| s.to_string());
+        }
+        if let Some(pane) = self.get_active_pane_or_overlay().filter(|_| name.is_none()) {
             if let Some(overlay) = self.pane_state(pane.pane_id()).overlay.as_mut() {
                 name = overlay
                     .key_table_state
