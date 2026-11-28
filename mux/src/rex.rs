@@ -112,6 +112,10 @@ fn remembered_vars() -> &'static Mutex<HashMap<String, HashMap<String, String>>>
     static VARS: std::sync::OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = std::sync::OnceLock::new();
     VARS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// A session view without a window: its last pane exited.
+fn view_is_empty(view: &Value) -> bool {
+    view["windows"].is_null() || view["windows"].as_array().is_some_and(|w| w.is_empty())
+}
 fn remember_var(endpoint: &str, block: &str, name: &str, value: &str) {
     if !REMEMBERED_VARS.contains(&name) { return; }
     let mut all = remembered_vars().lock();
@@ -376,7 +380,13 @@ impl RexDomain {
             }
         }
         // Rex serializes the last closed window as null, not necessarily [].
-        if view["windows"].is_null() || view["windows"].as_array().is_some_and(|w|w.is_empty()) {
+        // The last pane exited: end the session, as tmux does, so no empty
+        // session stays on the server (Rex keeps one), then leave.
+        if view_is_empty(&view) {
+            if let (Some(id),Ok((client,_)))=(view["session_id"].as_str(),self.connection()) {
+                log::info!("Rex session {id} has no pane left: destroying it");
+                if let Err(e)=client.call("session.destroy",json!({"session_id":id})).await {log::warn!("Rex destroy empty session: {e:#}")}
+            }
             return self.detach();
         }
         {
@@ -714,6 +724,33 @@ impl RexDomain {
         mux.notify(MuxNotification::WindowInvalidated(window));
         Ok(())
     }
+    /// The sessions on the server, without empty ones. A session whose last
+    /// pane exited while no client watched (or that an older client left)
+    /// is destroyed here. Its own connection: calls on other sessions need
+    /// session.attach_all, which would widen the domain connection's events.
+    async fn live_sessions(&self) -> Result<Vec<Value>> {
+        let (client, _events) = Client::connect(self.config.endpoint.clone()).await?;
+        let listed = client.call("session.attach_all", json!({"event_scope":"session"})).await?;
+        let sessions: Vec<Value> = listed["sessions"].as_array().cloned().unwrap_or_default();
+        let views = sessions.iter()
+            .map(|s| client.enqueue("session.view", json!({"session_id":s["session_id"]})))
+            .collect::<Result<Vec<_>>>()?;
+        let mut live = Vec::new();
+        for (session, view) in sessions.into_iter().zip(views) {
+            match view.await {
+                Ok(view) if view_is_empty(&view) => {
+                    log::info!("Rex session {} has no pane left: destroying it", session["session_id"]);
+                    if let Err(e) = client.call("session.destroy", json!({"session_id":session["session_id"]})).await {
+                        log::warn!("Rex destroy empty session: {e:#}");
+                    }
+                }
+                // A session destroyed meanwhile is gone; keep the others.
+                Ok(_) => live.push(session),
+                Err(e) => log::debug!("Rex session view: {e:#}"),
+            }
+        }
+        Ok(live)
+    }
     async fn switch_session(&self, target: &str) -> Result<()> {
         let (client, previous) = self.connection()?;
         // The chooser already supplies a server ID. Do not repeat its list
@@ -723,8 +760,9 @@ impl RexDomain {
                 if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })) {
             Some(target.to_owned())
         } else {
-            let sessions = client.call("session.list", json!({})).await?;
-            sessions["sessions"].as_array().into_iter().flatten()
+            // An empty session of that name ends here; a new one starts.
+            let sessions = self.live_sessions().await?;
+            sessions.iter()
                 .find(|s| s["session_id"] == target || s["label"] == target)
                 .and_then(|s| s["session_id"].as_str()).map(str::to_owned)
         };
@@ -1844,6 +1882,11 @@ impl RexPane {
             )
             .await?;
             return Ok(Value::Null);
+        }
+        if method == "wezterm.sessions" {
+            let domain = Mux::get().get_domain(self.domain).context("Rex domain")?;
+            let sessions = Box::pin(domain.downcast_ref::<RexDomain>().context("Rex domain")?.live_sessions()).await?;
+            return Ok(json!({"sessions": sessions}));
         }
         if method == "wezterm.buffer_set" || method == "wezterm.buffer_get" {
             use sha2::{Digest, Sha256};

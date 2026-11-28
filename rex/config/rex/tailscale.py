@@ -374,6 +374,9 @@ class Popup:
             para('On the tailnet' + (' ' + s['tailnet_name'] if s.get('tailnet_name') else ''), GREEN)
             para('Rex apps on your phone or other computers connect to this address. '
                  'Who may connect: ' + who + '.')
+            para('The phone needs the Tailscale app, turned on and signed in '
+                 + ('to this tailnet' if s.get('allow_tailnet_members') else 'as ' + (account or 'that account'))
+                 + ', and no other VPN on.', DIM)
         elif state == 'running':
             para('On the tailnet. Waiting for the HTTPS certificate…')
         else:

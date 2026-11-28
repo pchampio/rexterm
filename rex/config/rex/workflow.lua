@@ -329,7 +329,7 @@ function M.apply(config, wezterm, module_dir)
   local switch_session=callback(function(w,p)
     if not context(p) then status.message(wezterm,w,'Run tm or rex-attach in this shell to attach a session');return end
     local choices={}
-    for _,s in ipairs(call(p,'session.list').sessions) do
+    for _,s in ipairs(call(p,'wezterm.sessions').sessions) do
       if s.session_id~=context(p).session_id and not (s.label or ''):find('ppt') and not (s.label or ''):find('scc') then choices[#choices+1]={id=s.session_id,label=s.label or s.session_id} end
     end
     selector.open(wezterm,w,p,{title='Switch session / type a new name',choices=choices,query=true,width=.3,height=.3},function(id)

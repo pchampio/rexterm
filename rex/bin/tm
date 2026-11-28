@@ -76,6 +76,7 @@ class Rex:
         """Start (or find) the private server with the companion, and make sure the server has it."""
         if self.ready:
             return
+        state = None
         if not self.endpoint:
             config = self.root/'config/rex/server.lua'
             if not config.is_file():
@@ -96,6 +97,35 @@ class Rex:
             sys.exit('tm: this Rex server has no WezTerm companion. Use the private server, '
                      'or load config/rex/server.lua in that server.')
         self.ready = True
+        self.prune(state)
+
+    def prune(self, state):
+        """End the sessions that nobody uses any more, as tmux would.
+
+        After a reboot, every session of the private server: Rex saves its
+        sessions and brings them back with new shells, but tmux sessions end
+        with the machine. And on any server, a session whose last pane
+        exited: Rex keeps it, empty."""
+        def api(method, payload):
+            result = subprocess.run([self.binary, '-S', self.endpoint, '--autostart=false', 'api', 'call', method,
+                                     json.dumps(payload)], text=True, capture_output=True, timeout=15)
+            return json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
+        rebooted = False
+        boot = Path('/proc/sys/kernel/random/boot_id')
+        if state is not None and boot.is_file():
+            mark, current = state/'boot-id', boot.read_text().strip()
+            try:
+                previous = mark.read_text().strip() if mark.is_file() else ''
+                rebooted = bool(previous) and previous != current
+                if previous != current:
+                    mark.parent.mkdir(parents=True, exist_ok=True)
+                    mark.write_text(current + '\n')
+            except OSError as error:  # The cleanup must never stop an attach.
+                print(f'tm: {mark}: {error}', file=sys.stderr)
+        for s in (api('session.list', {}) or {}).get('sessions') or []:
+            view = None if rebooted else api('session.view', {'session_id': s['session_id']})
+            if rebooted or (view is not None and not view.get('windows')):
+                api('session.destroy', {'session_id': s['session_id']})
 
     def sessions(self):
         self.start()
