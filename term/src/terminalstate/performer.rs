@@ -848,9 +848,7 @@ impl<'a> Performer<'a> {
             {
                 if let Some((event, value)) = wezterm_program_status::agent_event(&unspec[1..]) {
                     if event == "clear" {
-                        for event in ["status", "agent", "title", "message", "tool", "subagents", "background_tasks", "session_crons"] {
-                            self.publish_status_var(format!("WEZTERM_AGENT_{}", event.to_uppercase()), String::new());
-                        }
+                        self.clear_agent_vars();
                     } else {
                         self.publish_status_var(format!("WEZTERM_AGENT_{}", event.to_uppercase()), value);
                     }
@@ -955,6 +953,7 @@ impl<'a> Performer<'a> {
             ) => {
                 self.program_status.prompt_or_exit();
                 self.publish_program_status();
+                self.clear_agent_vars();
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
                 self.prompt_marked();
@@ -964,6 +963,7 @@ impl<'a> Performer<'a> {
             ) => {
                 self.program_status.prompt_or_exit();
                 self.publish_program_status();
+                self.clear_agent_vars();
                 self.pen.set_semantic_type(SemanticType::Prompt);
                 if kind == FinalTermPromptKind::Initial {
                     self.prompt_started();

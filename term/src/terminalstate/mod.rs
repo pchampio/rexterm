@@ -599,6 +599,19 @@ impl TerminalState {
     pub fn program_status_process_exited(&mut self) {
         self.program_status.prompt_or_exit();
         self.publish_program_status();
+        self.clear_agent_vars();
+    }
+
+    /// Forget the OSC 7777 agent details (WEZTERM_AGENT_*). An agent that
+    /// exits or crashes cannot send its own clear, and the shell prompt or the
+    /// exit of the process means that it is gone.
+    pub(crate) fn clear_agent_vars(&mut self) {
+        for event in ["status", "agent", "title", "message", "tool", "subagents", "background_tasks", "session_crons"] {
+            let name = format!("WEZTERM_AGENT_{}", event.to_uppercase());
+            if self.user_vars.get(&name).is_some_and(|v| !v.is_empty()) {
+                self.publish_status_var(name, String::new());
+            }
+        }
     }
 
     fn publish_program_status(&mut self) {

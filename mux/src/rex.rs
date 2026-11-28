@@ -1597,7 +1597,21 @@ impl RexPane {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|r| (r["id"].as_str().unwrap_or("").to_owned(), r.clone()))
+            .map(|r| {
+                // The same shape as a local pane's records: app is the
+                // inherited one, and msg and title are plain one-line labels
+                // (the program's text can hold bidi overrides).
+                let mut r = r.clone();
+                if let Some(app) = r.get("effective_app").cloned() {
+                    r["app"] = app;
+                }
+                for key in ["msg", "title"] {
+                    if let Some(text) = r[key].as_str().map(wezterm_program_status::label) {
+                        r[key] = Value::String(text);
+                    }
+                }
+                (r["id"].as_str().unwrap_or("").to_owned(), r)
+            })
             .collect::<serde_json::Map<_, _>>();
         self.publish_var("WEZTERM_PROGRAM_STATUS", serde_json::to_string(&records)?);
         Ok(())

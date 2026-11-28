@@ -75,3 +75,18 @@ fn status_query_is_answered_once_and_suppressed_for_mirrors() {
     }
     std::assert_eq!(&*output.lock().unwrap(), b"x");
 }
+
+#[test]
+fn shell_prompt_forgets_agent_details() {
+    let mut t = TestTerm::new(4, 40, 100);
+    t.print(b"\x1b]7777;agent;claude\x07\x1b]7777;tool;Bash: cargo test\x07");
+    t.print(b"\x1b]7501;state=working:id=claude:app=claude-code\x1b\\");
+    std::assert_eq!(t.term.user_vars()["WEZTERM_AGENT_AGENT"], "claude");
+    // The agent crashed: the shell prompt comes back.
+    t.print(b"\x1b]133;A\x07");
+    std::assert_eq!(t.term.user_vars()["WEZTERM_AGENT_AGENT"], "");
+    std::assert_eq!(t.term.user_vars()["WEZTERM_AGENT_TOOL"], "");
+    std::assert_eq!(t.term.user_vars()["WEZTERM_PROGRAM_STATUS"], "{}");
+    // Variables that were never set are not published as empty ones.
+    assert!(!t.term.user_vars().contains_key("WEZTERM_AGENT_SUBAGENTS"));
+}

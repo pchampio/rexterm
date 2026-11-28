@@ -10,13 +10,30 @@ local rank = { idle = 0, done = 1, working = 2, error = 3, blocked = 4 }
 local names = { idle = '', working = 'Working', done = 'Done', error = 'Error', blocked = 'Needs input' }
 local kinds = { permission = 'Approval', question = 'Question', auth = 'Sign-in' }
 
+-- The state of the agent in a pane: 'working', 'needs_input', 'idle' or ''
+-- (no agent), and its message. bin/rex-agent-status reports it with OSC 7501,
+-- in the record that has the agent's name as its id; another tool can still
+-- report it with OSC 7777 (status;...).
+local function agent_status(wezterm, vars)
+  local name = vars.WEZTERM_AGENT_AGENT or ''
+  if name ~= '' then
+    local ok, records = pcall(wezterm.json_parse, vars.WEZTERM_PROGRAM_STATUS or '{}')
+    local r = ok and type(records) == 'table' and records[name]
+    if type(r) == 'table' then
+      return ({ working = 'working', blocked = 'needs_input' })[r.state] or 'idle', r.msg or ''
+    end
+  end
+  return vars.WEZTERM_AGENT_STATUS or '', vars.WEZTERM_AGENT_MESSAGE or ''
+end
+M.agent_status = agent_status
+
 local function summarize(wezterm, vars)
   local result = { state = 'idle', text = '', message = '' }
   local ok, records = pcall(wezterm.json_parse, vars.WEZTERM_PROGRAM_STATUS or '{}')
   if ok and type(records) == 'table' then
     for _, r in pairs(records) do
       if type(r) == 'table' and (rank[r.state] or -1) > rank[result.state] then
-        result = { state = r.state, text = kinds[r.kind] or names[r.state], message = r.msg or r.title or '', kind = r.kind, app = r.app }
+        result = { state = r.state, text = kinds[r.kind] or names[r.state], message = r.msg or r.title or '', kind = r.kind, app = r.effective_app or r.app }
         if type(r.progress) == 'number' then result.text = result.text .. ' ' .. tostring(r.progress) .. '%' end
       end
     end
@@ -98,7 +115,7 @@ function M.apply(config, wezterm, module_dir)
     now.unread = prev.unread or 0
     -- An agent that finishes while you look elsewhere shows a check until
     -- you come back to its tab (update-status clears it).
-    local agent_idle = now.state == 'idle' and vars.WEZTERM_AGENT_STATUS == 'idle'
+    local agent_idle = now.state == 'idle' and agent_status(wezterm, vars) == 'idle'
     if agent_idle and not visible(window, pane) and (prev.agent_done or prev.state == 'working' or prev.state == 'blocked') then
       now.state, now.text, now.agent_done = 'done', 'Done', true
     end
@@ -176,12 +193,13 @@ function M.apply(config, wezterm, module_dir)
     local found={}
     for _,p in ipairs(panes(active_tab(window))) do
       local valid,vars=pcall(function()return p:get_user_vars()end)
-      if valid and ((vars.WEZTERM_AGENT_STATUS or '')~='' or (vars.WEZTERM_AGENT_AGENT or '')~='') then
+      local status,message=agent_status(wezterm,valid and vars or {})
+      if valid and (status~='' or (vars.WEZTERM_AGENT_AGENT or '')~='') then
         local name=vars.WEZTERM_AGENT_AGENT
         if not name or name=='' then name=(vars.WEZTERM_AGENT_TITLE or ''):match('^(%S+)') or 'agent' end
         local ok,c=pcall(function()return p:rex_context()end)
-        found[#found+1]={name=name,status=vars.WEZTERM_AGENT_STATUS or 'idle',title=vars.WEZTERM_AGENT_TITLE or '',
-          detail=(vars.WEZTERM_AGENT_STATUS=='needs_input' and vars.WEZTERM_AGENT_MESSAGE) or vars.WEZTERM_AGENT_TOOL or '',
+        found[#found+1]={name=name,status=status~='' and status or 'idle',title=vars.WEZTERM_AGENT_TITLE or '',
+          detail=(status=='needs_input' and message) or vars.WEZTERM_AGENT_TOOL or '',
           block_id=ok and c and c.block_id or '',pane_id=p:pane_id(),icon=agent_tile(name)}
       end
     end
@@ -279,7 +297,8 @@ function M.apply(config, wezterm, module_dir)
     local working=false
     for _,peer in ipairs(panes(active_tab(window))) do
       local valid,peer_vars=pcall(function()return peer:get_user_vars()end)
-      if valid and (peer_vars.WEZTERM_AGENT_STATUS=='working' or peer_vars.WEZTERM_AGENT_STATUS=='needs_input') then working=true;break end
+      local status=valid and agent_status(wezterm,peer_vars)
+      if status=='working' or status=='needs_input' then working=true;break end
     end
     local last=(wezterm.GLOBAL.rex_agent_poll or {})[ok and c and c.session_id or '']
     if ok and c and (entry or working) and os.time()-(entry and entry.time or last or 0)>=(entry and 2 or 1) then
@@ -298,7 +317,7 @@ function M.apply(config, wezterm, module_dir)
     end
     for _,peer in ipairs(panes(active_tab(window))) do
       local valid,peer_vars=pcall(function()return peer:get_user_vars()end)
-      if valid and ((peer_vars.WEZTERM_AGENT_STATUS or '')~='' or (peer_vars.WEZTERM_AGENT_AGENT or '')~='') then
+      if valid and (agent_status(wezterm,peer_vars)~='' or (peer_vars.WEZTERM_AGENT_AGENT or '')~='') then
         local name=peer_vars.WEZTERM_AGENT_AGENT
         if not name or name=='' then name=(peer_vars.WEZTERM_AGENT_TITLE or ''):match('^(%S+)') or 'agent' end
         add(name)
