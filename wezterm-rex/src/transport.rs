@@ -11,6 +11,12 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 
+/// The newest Rex API revision this client speaks. Revisions 15 to 19 add
+/// methods and events (ports_changed, event_dropped, download_begin, prompts)
+/// and change no shape that this client reads. From 17 on, the server asks
+/// every app to show rex.ui prompts: the control loop declines them.
+pub const API_REVISION: u64 = 19;
+
 #[derive(Debug)]
 pub struct RpcError(pub Value);
 impl std::fmt::Display for RpcError {
@@ -153,7 +159,21 @@ impl Client {
                                                 else {Ok(Reply{payload:value["payload"].clone(),seq:value["seq"].as_u64().context("Rex reply missing sequence")?})};
                                                 p.reply.send(result).ok();
                                             }
-                                        } else if value["type"]=="event" {events_tx.try_send(value).context("Rex event consumer stalled or closed")?;}
+                                        } else if value["type"]=="event" {
+                                            // A prompt (rex.ui) or a call on another server: this
+                                            // client shows no prompts and makes no such calls. Say
+                                            // so at once, so the action does not wait for its
+                                            // timeout, and the other apps keep the prompt.
+                                            let kind=value["payload"]["type"].as_str().unwrap_or("");
+                                            if let ("client_prompt_requested"|"client_call_requested",Some(call))=(kind,value["payload"]["payload"]["call_id"].as_str()) {
+                                                next_id+=1;
+                                                let reply=json!({"type":"request","id":next_id.to_string(),"method":"client.reply","payload":{"call_id":call,
+                                                    "error":{"code":"not_supported","message":"WezTerm Rex does not show Rex prompts or call other servers"}}});
+                                                tokio::time::timeout(Duration::from_secs(10),ws.send(Message::text(reply.to_string()))).await??;
+                                                continue;
+                                            }
+                                            events_tx.try_send(value).context("Rex event consumer stalled or closed")?;
+                                        }
                                     },
                                     Message::Close(_)=>bail!("Rex disconnected"),
                                     _=>ws.flush().await?,
@@ -239,7 +259,7 @@ impl Client {
 
 async fn hello(endpoint: &str, token: Option<&str>) -> Result<(Socket, Value)> {
     let mut ws = socket(endpoint, "/api/control", "rex.control.v1").await?;
-    let mut hello = json!({"type":"hello","api_revision":14,"api_min_revision":10,"client":{"kind":"app","platform":"linux","name":"WezTerm Rex"}});
+    let mut hello = json!({"type":"hello","api_revision":API_REVISION,"api_min_revision":10,"client":{"kind":"app","platform":"linux","name":"WezTerm Rex"}});
     if let Some(token) = token {
         hello["reconnect_token"] = json!(token);
     }
@@ -257,8 +277,75 @@ async fn hello(endpoint: &str, token: Option<&str>) -> Result<(Socket, Value)> {
         .as_u64()
         .context("missing negotiated API revision")?;
     ensure!(
-        (10..=14).contains(&revision),
+        (10..=API_REVISION).contains(&revision),
         "unsupported Rex API revision {revision}"
     );
     Ok((ws, welcome))
+}
+
+/// The JSON-encoded size that one piece of input text may have. Every Rex
+/// server accepts messages of at least 64 KiB (`limits.max_message_bytes`
+/// is never lower), and the request around the text needs a few hundred
+/// bytes, so pieces of this size always fit, whatever the server's limit.
+pub const INPUT_CHUNK_JSON_BYTES: usize = 56 * 1024;
+
+/// The bytes that `c` takes inside a JSON string, as serde_json writes it.
+fn json_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// `text` cut into pieces that each take at most `budget` bytes once
+/// JSON-encoded. A paste of newlines doubles in size when encoded, and a
+/// request over the server's limit is refused, so the size is counted
+/// after encoding. Pieces end on character boundaries.
+pub fn json_text_chunks(text: &str, budget: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let (mut start, mut size) = (0, 0);
+    for (index, c) in text.char_indices() {
+        let len = json_char_len(c);
+        if size + len > budget && index > start {
+            pieces.push(&text[start..index]);
+            (start, size) = (index, 0);
+        }
+        size += len;
+    }
+    if start < text.len() || pieces.is_empty() {
+        pieces.push(&text[start..]);
+    }
+    pieces
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn short_text_is_one_piece() {
+        assert_eq!(json_text_chunks("ls -la\n", 100), vec!["ls -la\n"]);
+        assert_eq!(json_text_chunks("", 100), vec![""]);
+    }
+
+    #[test]
+    fn pieces_fit_once_encoded_and_join_back() {
+        let text = "a\"b\\c\n".repeat(40_000) + &"é€😀\u{1}\t".repeat(20_000);
+        let pieces = json_text_chunks(&text, INPUT_CHUNK_JSON_BYTES);
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.concat(), text);
+        for piece in pieces {
+            let encoded = serde_json::to_string(piece).unwrap();
+            // The two quotes are the request's, not the budget's.
+            assert!(encoded.len() - 2 <= INPUT_CHUNK_JSON_BYTES, "{}", encoded.len());
+        }
+    }
+
+    #[test]
+    fn newlines_count_twice() {
+        let text = "\n".repeat(10);
+        let pieces = json_text_chunks(&text, 8);
+        assert_eq!(pieces, vec!["\n\n\n\n", "\n\n\n\n", "\n\n"]);
+    }
 }

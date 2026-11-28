@@ -1165,6 +1165,20 @@ impl Domain for RexDomain {
                 }
                 if event["seq"].as_u64().unwrap_or(0)<=seq{continue}
                 let envelope=&event["payload"];
+                // An event too large to send (API revision 15 and later): fetch
+                // what it would have changed, the layout and each pane's state.
+                if envelope["type"]=="event_dropped" {
+                    let ours=envelope["payload"]["session_id"].as_str().is_some_and(|id|id==domain.state.lock().session);
+                    log::warn!("Rex dropped an event too large to send: {}",envelope["payload"]);
+                    if ours {
+                        if let Err(e)=domain.refresh().await{log::error!("Rex refresh after a dropped event: {e:#}")}
+                        let panes=domain.state.lock().panes.values().cloned().collect::<Vec<_>>();
+                        for pane in panes {
+                            if let Err(e)=pane.refresh_status().await{log::debug!("Rex status after a dropped event: {e:#}")}
+                        }
+                    }
+                    continue;
+                }
                 // kill-session here or `rex kill` elsewhere: leave like a detach.
                 if envelope["type"]=="session_destroyed" && envelope["payload"]["session_id"].as_str().is_some_and(|id|id==domain.state.lock().session) {
                     if let Err(e)=domain.detach(){log::error!("Rex session destroyed: {e:#}")}
@@ -1373,6 +1387,17 @@ impl Input {
         Ok(())
     }
     fn event(&self, kind: &str, payload: Value) -> Result<()> {
+        // A large paste goes as several paste events, in order on this
+        // connection: one request over the server's message limit would be
+        // refused, and the paste lost.
+        if kind == "paste" {
+            if let Some(text) = payload["text"].as_str() {
+                for piece in wezterm_rex::transport::json_text_chunks(text, wezterm_rex::transport::INPUT_CHUNK_JSON_BYTES) {
+                    self.call("block.event",json!({"session_id":self.session,"block_id":self.block,"event":{"type":kind,"payload":{"text":piece}}}))?;
+                }
+                return Ok(());
+            }
+        }
         self.call("block.event",json!({"session_id":self.session,"block_id":self.block,"event":{"type":kind,"payload":payload}}))
     }
 }
@@ -1380,11 +1405,13 @@ impl Write for Input {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
         let text = std::str::from_utf8(b)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        self.call(
-            "com.superlogical.terminal.write",
-            json!({"session_id":self.session,"block_id":self.block,"args":{"data":text}}),
-        )
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        for piece in wezterm_rex::transport::json_text_chunks(text, wezterm_rex::transport::INPUT_CHUNK_JSON_BYTES) {
+            self.call(
+                "com.superlogical.terminal.write",
+                json!({"session_id":self.session,"block_id":self.block,"args":{"data":piece}}),
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
         Ok(b.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {

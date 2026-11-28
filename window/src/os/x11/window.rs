@@ -36,6 +36,9 @@ struct CopyAndPaste {
     clipboard_request: Option<Promise<String>>,
     selection_request: Option<Promise<String>>,
     time: u32,
+    /// A selection that arrives in parts (the INCR protocol, used for large
+    /// clipboards): which clipboard, the target asked for, the bytes so far.
+    incr: Option<(Clipboard, Atom, Vec<u8>)>,
 }
 
 impl CopyAndPaste {
@@ -818,6 +821,15 @@ impl XWindowInner {
                 }
             }
             Event::X(xcb::x::Event::PropertyNotify(msg)) => {
+                if msg.atom() == conn.atom_xsel_data
+                    && msg.state() == xcb::x::Property::NewValue
+                    && self.copy_and_paste.incr.is_some()
+                {
+                    if let Err(err) = self.incr_part() {
+                        log::error!("Error reading a clipboard part: {err:#}");
+                    }
+                    return Ok(());
+                }
                 let atom_name = conn.atom_name(msg.atom());
                 log::trace!("PropertyNotifyEvent {atom_name}");
 
@@ -1061,6 +1073,51 @@ impl XWindowInner {
         Ok(())
     }
 
+    /// One part of an INCR selection transfer. Reading the property with
+    /// delete asks the owner for the next part; an empty part is the end.
+    fn incr_part(&mut self) -> anyhow::Result<()> {
+        let conn = self.conn();
+        let prop = conn.send_and_wait_request(&xcb::x::GetProperty {
+            delete: true,
+            window: self.window_id,
+            property: conn.atom_xsel_data,
+            r#type: xcb::x::ATOM_ANY,
+            long_offset: 0,
+            long_length: u32::max_value(),
+        });
+        let prop = match prop {
+            Ok(prop) => prop,
+            Err(err) => {
+                if let Some((clipboard, _, _)) = self.copy_and_paste.incr.take() {
+                    if let Some(mut promise) = self.copy_and_paste.request_mut(clipboard).take() {
+                        promise.ok(String::new());
+                    }
+                }
+                return Err(err.into());
+            }
+        };
+        let value: &[u8] = prop.value();
+        if !value.is_empty() {
+            if let Some((_, _, data)) = self.copy_and_paste.incr.as_mut() {
+                data.extend_from_slice(value);
+            }
+            return Ok(());
+        }
+        let Some((clipboard, target, data)) = self.copy_and_paste.incr.take() else {
+            return Ok(());
+        };
+        log::trace!("SEL: INCR transfer done, {} bytes", data.len());
+        if let Some(mut promise) = self.copy_and_paste.request_mut(clipboard).take() {
+            let text = if target == xcb::x::ATOM_STRING {
+                data.iter().map(|&c| c as char).collect()
+            } else {
+                String::from_utf8_lossy(&data).to_string()
+            };
+            promise.ok(text);
+        }
+        Ok(())
+    }
+
     fn selection_notify(&mut self, selection: &xcb::x::SelectionNotifyEvent) -> anyhow::Result<()> {
         let conn = self.conn();
         let window_id = self.window_id;
@@ -1113,6 +1170,17 @@ impl XWindowInner {
                 long_offset: 0,
                 long_length: u32::max_value(),
             }) {
+                Ok(prop) if prop.r#type() == conn.atom_incr => {
+                    // A large selection comes in parts: deleting the property
+                    // asks for the first one; each part arrives as a
+                    // PropertyNotify (see incr_part), an empty part ends it.
+                    log::trace!("SEL: window_id={window_id:?} -> INCR transfer starts");
+                    self.copy_and_paste.incr = Some((clipboard, selection.target(), Vec::new()));
+                    conn.send_request_no_reply(&xcb::x::DeleteProperty {
+                        window: self.window_id,
+                        property: conn.atom_xsel_data,
+                    })?;
+                }
                 Ok(prop) => {
                     if let Some(mut promise) = self.copy_and_paste.request_mut(clipboard).take() {
                         fn latin1_to_string(s: &[u8]) -> String {

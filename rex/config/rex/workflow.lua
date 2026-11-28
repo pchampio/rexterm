@@ -196,6 +196,17 @@ function M.apply(config, wezterm, module_dir)
   local python=popup('Python pad',{'python3'},.65,.65)
   local btop=popup('btop',{'sh','-c',cpu_monitor,'btop'},.7,.5)
   local nvitop=popup('nvitop',{'sh','-c',gpu_monitor,'nvitop',''},.6,.6)
+  -- prefix a T: Tailscale connect. tailscale.py runs in the popup, on the
+  -- machine of the Rex server, and talks to the server with its own rex
+  -- command. REX_TAILSCALE_TEST_REX: a stand-in rex for the tests.
+  local tailscale
+  do
+    local file=io.open(module_dir..'/tailscale.py','r')
+    if file then
+      local script=file:read('*a');file:close()
+      tailscale=popup('Tailscale',{'python3','-c',script,os.getenv('REX_TAILSCALE_TEST_REX') or ''},.5,.85)
+    end
+  end
   local function hide_or_detach(w,p)
     local c=context(p)
     -- An agent shell: take the popup away, the command keeps running.
@@ -517,7 +528,7 @@ function M.apply(config, wezterm, module_dir)
   end)
 
   local actions={
-    p=python,g=path_select,h=btop,n=nvitop,['\\']=callback(function(w,p)port_forwards(w,p)end),M=rpc("wezterm.overview"),L=callback(switch_window),d=callback(hide_or_detach),
+    p=python,g=path_select,h=btop,n=nvitop,T=tailscale,['\\']=callback(function(w,p)port_forwards(w,p)end),M=rpc("wezterm.overview"),L=callback(switch_window),d=callback(hide_or_detach),
     f=extract,F=act.QuickSelectArgs{action=callback(function(w,p)
       local text=w:get_selection_text_for_pane(p)
       if text and text~='' then
@@ -550,7 +561,7 @@ function M.apply(config, wezterm, module_dir)
   local menu
   do
     local entries={{'p','Python'},{'c','env activate'}, {},
-      {'n','Nvitop'},{'h','Btop'},{'\\','Port forwards'}, {},
+      {'n','Nvitop'},{'h','Btop'},{'\\','Port forwards'},{'T','Tailscale connect'}, {},
       {'M','Windows mosaic'},{'t','Switch client'},{'L','Switch window'},{'_','Break pane'},{'j','Join Pane'},{'r','Rename session'},{'d','Detach client'}, {},
       {'f','Find in pane extrakto/fzf'},{'F','Find in pane thumbs/hints'},{'g','Find path:line in pane'},{'b','Select previous command'},{'B','Open last output in nvim'},{'P','Capture pane'}, {},
       {'<','Swap Pane Up'},{'>','Swap Pane Down'},{'m','Mark'},{'s','Swap Marked pane'},{'S','Swap Marked window'}, {},
@@ -564,7 +575,7 @@ function M.apply(config, wezterm, module_dir)
       local ok_tabs,tabs=pcall(function()return #w:mux_window():tabs()end)
       tabs=ok_tabs and tabs or 1
       local marked=c and mark and mark.session_id==c.session_id
-      local unavailable={['\\']=not c,c=not c,M=not c,r=not c,m=not c,t=not c,B=not c,P=not c,
+      local unavailable={['\\']=not c,T=not c,c=not c,M=not c,r=not c,m=not c,t=not c,B=not c,P=not c,
         ['_']=not c or panes<2,['<']=not c or panes<2,['>']=not c or panes<2,j=not c or tabs<2,
         s=not marked or mark.block_id==c.block_id,S=not marked or mark.window_id==c.window_id,
         d=not c and not p:is_popup_visible()}
