@@ -403,12 +403,12 @@ class Popup:
         elif time.time() < self.note_until:
             lines.append('')
             para(self.note, GREEN)
-        keys = ['c copy'] if qr_text else []
+        keys = ['c: copy'] if qr_text else []
         if state == 'disabled':
-            keys.insert(0, 'Enter turn on')
+            keys.insert(0, 'Enter: turn on')
         elif self.status is not None:
-            keys.append('x x turn off' if time.time() > self.confirm_off else 'x again: turn off')
-        keys.append('q close')
+            keys.append('x twice: turn off' if time.time() > self.confirm_off else 'x again: turn off')
+        keys.append('q: close')
         footer = ' ' + '  ·  '.join(keys)
         if len(footer) > cols:
             footer = ' ' + ' · '.join(keys)
